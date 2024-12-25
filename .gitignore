@@ -1,0 +1,10 @@
+# Node.js
+node_modules
+# Python
+venv
+__pycache__
+# React Native build files
+android/app/build
+ios/Pods
+# etc.
+.env
