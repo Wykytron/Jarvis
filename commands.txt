@@ -1,0 +1,61 @@
+backend:
+cd Folder 
+ .\venv\Scripts\Activate.ps1
+uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+
+frontend:
+cd frontend
+ npx react-native run-android
+
+
+git status
+git add .
+git commit -m "Some descriptive message"
+git push origin main
+
+
+
+
+npx react-native log-Android
+
+npx patch-package react-native-safe-area-context
+
+cd C:\Projects\Jarvis\v10\frontendApp
+
+cd C:\Projects\Jarvis\v11\frontendApp
+
+    namespace "com.reactnativecommunity.picker"
+    namespace "org.reactnative.maskedview"
+    namespace "com.th3rdwave.safeareacontext"
+    namespace "com.swmansion.rnscreens"
+    namespace "net.no_mad.tts"
+    namespace "com.oblador.vectoricons"
+    namespace "com.wenkesj.voice"
+
+
+./gradlew --stop
+
+# List processes related to Gradle
+Get-Process -Name "java", "gradle"
+
+# Force kill Gradle processes (If Get-Process lists them)
+Stop-Process -Name "java" -Force
+Stop-Process -Name "gradle" -Force
+
+
+# Manually remove these folders using "takeown" and "icacls" to take ownership
+
+# 1. Take ownership of the directories (for Windows file permissions issues)
+takeown /F "$env:USERPROFILE\.gradle\wrapper\dists\gradle-7.6-all" /R /D Y
+takeown /F "$env:USERPROFILE\.gradle\caches" /R /D Y
+takeown /F "C:\Projects\Jarvis\v10\frontendApp\android\.gradle" /R /D Y
+
+# 2. Grant full control to the current user
+icacls "$env:USERPROFILE\.gradle\wrapper\dists\gradle-7.6-all" /grant "%USERNAME%:F" /T /C
+icacls "$env:USERPROFILE\.gradle\caches" /grant "%USERNAME%:F" /T /C
+icacls "C:\Projects\Jarvis\v10\frontendApp\android\.gradle" /grant "%USERNAME%:F" /T /C
+
+# 3. Force delete the files
+Remove-Item -Recurse -Force "$env:USERPROFILE\.gradle\wrapper\dists\gradle-7.6-all"
+Remove-Item -Recurse -Force "$env:USERPROFILE\.gradle\caches"
+Remove-Item -Recurse -Force "C:\Projects\Jarvis\v10\frontendApp\android\.gradle"
