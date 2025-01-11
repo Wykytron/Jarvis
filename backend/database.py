@@ -1,5 +1,4 @@
-# backend/database.py
-
+# database.py
 from sqlalchemy import create_engine, Column, Integer, Text, DateTime, String, LargeBinary
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
@@ -17,17 +16,19 @@ class ChatExchange(Base):
     llm_response = Column(Text, nullable=True)
     timestamp = Column(DateTime, default=datetime.utcnow)
 
-    # For re-displaying images in the chat
-    # We'll store base64 data if user sends an image
+    # For re-displaying images
     user_image_b64 = Column(Text, nullable=True)
-    # If the assistant returns an image (rare?), we could also do assistant_image_b64
+
+    # The LLM's structured data if it was an image:
+    image_title = Column(Text, nullable=True)
+    image_description = Column(Text, nullable=True)
 
 class Document(Base):
     __tablename__ = "documents"
 
     id = Column(Integer, primary_key=True, index=True)
     filename = Column(String)
-    file_content = Column(LargeBinary)  # store raw bytes
+    file_content = Column(LargeBinary)
     upload_time = Column(DateTime, default=datetime.utcnow)
     text_content = Column(Text, nullable=True)
     description = Column(Text, nullable=True)

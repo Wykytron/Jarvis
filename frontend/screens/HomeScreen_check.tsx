@@ -1,4 +1,3 @@
-// frontend/screens/HomeScreen.tsx
 import React, { useState, useEffect, useContext } from 'react';
 import {
   View,
@@ -15,7 +14,6 @@ import MaterialCommunityIcons from 'react-native-vector-icons/MaterialCommunityI
 import Tts from 'react-native-tts';
 import AudioRecord from 'react-native-audio-record';
 import axios from 'axios';
-
 import {
   launchCamera,
   launchImageLibrary,
@@ -25,127 +23,48 @@ import DocumentPicker, { types } from 'react-native-document-picker';
 
 import { ModelContext } from '../ModelContext';
 
-// ==================== BACKEND URLS =====================
+// Adjust these if needed:
 const BACKEND_URL = 'http://192.168.0.189:8000';
 const BACKEND_TRANSCRIBE_URL = `${BACKEND_URL}/api/transcribe`;
 const BACKEND_CHAT_URL = `${BACKEND_URL}/api/chat`;
 const BACKEND_INGEST_URL = `${BACKEND_URL}/api/ingest`;
-const BACKEND_IMAGE_RECOGNIZE_URL = `${BACKEND_URL}/api/image_recognize`;
-const BACKEND_HISTORY_URL = `${BACKEND_URL}/api/history`;
 
-// ==================== COMPONENT ========================
 function HomeScreen({ navigation }: any) {
   const { textModel, imageModel, whisperModel } = useContext(ModelContext);
 
-  // Chat messages
+  // Chat states
   const [messages, setMessages] = useState<any[]>([]);
-  // Recording state
   const [recording, setRecording] = useState(false);
+  const [audioFile, setAudioFile] = useState<string>('');
+  const [speakerOn, setSpeakerOn] = useState<boolean>(false);
+  const [textMessage, setTextMessage] = useState('');
 
-  // If the user picks an image
+  // File / image selection
   const [selectedImageUri, setSelectedImageUri] = useState<string | null>(null);
-  // If the user picks a doc
   const [selectedDoc, setSelectedDoc] = useState<{
     uri: string;
     name: string;
     type: string;
   } | null>(null);
 
-  // The typed text input
-  const [textMessage, setTextMessage] = useState('');
-
-  // Speaker toggle
-  const [speakerOn, setSpeakerOn] = useState(false);
-
-  // Attach menu toggle
-  const [showAttachMenu, setShowAttachMenu] = useState(false);
-
-  // Manage tasks & errors for a status popup
+  //========================================
+  // NEW: Manage tasks & errors for status
+  //========================================
   const [tasksInProgress, setTasksInProgress] = useState<string[]>([]);
   const [errors, setErrors] = useState<string[]>([]);
   const [showStatusPopup, setShowStatusPopup] = useState(false);
 
-  // ===================== USE EFFECT: Fetch History on Mount =====================
-  useEffect(() => {
-    MaterialCommunityIcons.loadFont();
-    fetchHistory();
-  }, []);
-
-  async function fetchHistory() {
-    try {
-      console.log('Fetching chat history...');
-      const resp = await axios.get(BACKEND_HISTORY_URL);
-      const { history } = resp.data;
-      const loaded: any[] = [];
-
-      history.forEach((ex: any) => {
-        // If user_message is present
-        if (ex.user_message && ex.user_message.trim()) {
-          loaded.push({
-            id: ex.id + '-user-text',
-            role: 'user',
-            type: 'text',
-            content: ex.user_message.trim(),
-          });
-        }
-        // If there's an image
-        if (ex.user_image_b64) {
-          loaded.push({
-            id: ex.id + '-user-img',
-            role: 'user',
-            type: 'image',
-            content: `data:image/jpeg;base64,${ex.user_image_b64}`,
-          });
-        }
-        // If there's an image title
-        if (ex.image_title && ex.image_title.trim()) {
-          loaded.push({
-            id: ex.id + '-user-imgtitle',
-            role: 'app',
-            type: 'text',
-            content: `<Title>${ex.image_title.trim()}</Title>`,
-          });
-        }
-        // If there's an image description
-        if (ex.image_description && ex.image_description.trim()) {
-          loaded.push({
-            id: ex.id + '-user-imgdesc',
-            role: 'app',
-            type: 'text',
-            content: `<Description>${ex.image_description.trim()}</Description>`,
-          });
-        }
-        // If assistant message
-        if (ex.llm_response && ex.llm_response.trim()) {
-          loaded.push({
-            id: ex.id + '-assistant',
-            role: 'app',
-            type: 'text',
-            content: ex.llm_response.trim(),
-          });
-        }
-      });
-
-      setMessages(loaded);
-      console.log('History loaded, total items:', loaded.length);
-    } catch (err) {
-      console.log('Error fetching history:', err);
-      addError(`Fetch history failed: ${err?.message || '(Network error)'}`);
-    }
-  }
-
-  // ===================== TASKS & ERRORS LOGIC =====================
   function addTask(label: string) {
     setTasksInProgress((prev) => [...prev, label]);
-    console.log('>>> addTask:', label);
+    console.log(`>>> addTask: ${label}`);
   }
   function removeTask(label: string) {
     setTasksInProgress((prev) => prev.filter((t) => t !== label));
-    console.log('>>> removeTask:', label);
+    console.log(`>>> removeTask: ${label}`);
   }
   function addError(msg: string) {
     setErrors((prev) => [...prev, msg]);
-    console.log('>>> addError:', msg);
+    console.log(`>>> addError: ${msg}`);
   }
   function clearErrors() {
     setErrors([]);
@@ -153,12 +72,17 @@ function HomeScreen({ navigation }: any) {
   function toggleStatusPopup() {
     setShowStatusPopup(!showStatusPopup);
   }
+
+  // Decide how the status button looks
   function getStatusButtonStyle() {
     if (errors.length > 0) {
+      // errors => red
       return { backgroundColor: 'red' };
     } else if (tasksInProgress.length > 0) {
+      // tasks => blue
       return { backgroundColor: 'blue' };
     }
+    // default
     return { backgroundColor: '#555' };
   }
   function getStatusButtonIconName() {
@@ -170,7 +94,21 @@ function HomeScreen({ navigation }: any) {
     return 'information-outline';
   }
 
-  // ===================== AUDIO RECORDING =====================
+  //========================================
+  // Single Attach Menu Toggle
+  //========================================
+  const [showAttachMenu, setShowAttachMenu] = useState(false);
+  function toggleAttachMenu() {
+    setShowAttachMenu(!showAttachMenu);
+  }
+
+  //========================================
+  // Effects, Permissions, etc.
+  //========================================
+  useEffect(() => {
+    MaterialCommunityIcons.loadFont();
+  }, []);
+
   async function requestPermissions() {
     try {
       await PermissionsAndroid.requestMultiple([
@@ -181,6 +119,7 @@ function HomeScreen({ navigation }: any) {
       console.warn(err);
     }
   }
+
   async function requestCameraPermission() {
     const granted = await PermissionsAndroid.request(
       PermissionsAndroid.PERMISSIONS.CAMERA,
@@ -190,11 +129,14 @@ function HomeScreen({ navigation }: any) {
         buttonNeutral: 'Ask Me Later',
         buttonNegative: 'Cancel',
         buttonPositive: 'OK',
-      }
+      },
     );
     return granted === PermissionsAndroid.RESULTS.GRANTED;
   }
 
+  //========================================
+  // Audio Recording
+  //========================================
   const startRecording = async () => {
     await requestPermissions();
     AudioRecord.init({
@@ -209,6 +151,7 @@ function HomeScreen({ navigation }: any) {
   const stopRecording = async () => {
     const filePath = await AudioRecord.stop();
     setRecording(false);
+    setAudioFile(filePath);
 
     addTask('Transcription');
     try {
@@ -223,8 +166,8 @@ function HomeScreen({ navigation }: any) {
       const resp = await axios.post(BACKEND_TRANSCRIBE_URL, formData, {
         headers: { 'Content-Type': 'multipart/form-data' },
       });
-      removeTask('Transcription');
 
+      removeTask('Transcription');
       const transcript = resp.data.transcript || '';
       setTextMessage(transcript);
     } catch (error: any) {
@@ -235,12 +178,9 @@ function HomeScreen({ navigation }: any) {
     }
   };
 
-  // ===================== ATTACH MENU =====================
-  function toggleAttachMenu() {
-    setShowAttachMenu(!showAttachMenu);
-  }
-
-  // ===================== CAMERA / GALLERY / DOC =====================
+  //========================================
+  // Camera / Gallery
+  //========================================
   const handleTakePhoto = async () => {
     toggleAttachMenu();
     const hasCam = await requestCameraPermission();
@@ -268,6 +208,9 @@ function HomeScreen({ navigation }: any) {
     }
   };
 
+  //========================================
+  // Doc Picker
+  //========================================
   const handlePickDoc = async () => {
     toggleAttachMenu();
     try {
@@ -276,13 +219,11 @@ function HomeScreen({ navigation }: any) {
         type: [types.pdf, types.docx, types.plainText],
       });
       console.log('Picked doc:', res);
-      if (res.uri) {
-        setSelectedDoc({
-          uri: res.uri,
-          name: res.name ?? 'unnamed',
-          type: res.type ?? 'application/octet-stream',
-        });
-      }
+      setSelectedDoc({
+        uri: res.uri,
+        name: res.name ?? 'unnamed',
+        type: res.type ?? 'application/octet-stream',
+      });
     } catch (err) {
       if (DocumentPicker.isCancel(err)) {
         console.log('User canceled doc picker');
@@ -292,9 +233,11 @@ function HomeScreen({ navigation }: any) {
     }
   };
 
-  // ===================== SENDING (Doc => Image => Text) =====================
+  //========================================
+  // Send (Doc / Image / Text)
+  //========================================
   const sendMessage = async () => {
-    // 1) If doc => /api/ingest
+    // 1) Doc ingest
     if (selectedDoc) {
       addTask('Doc Ingestion');
       try {
@@ -309,17 +252,16 @@ function HomeScreen({ navigation }: any) {
         const resp = await axios.post(BACKEND_INGEST_URL, formData, {
           headers: { 'Content-Type': 'multipart/form-data' },
         });
-        removeTask('Doc Ingestion');
-
         console.log('Doc ingestion resp:', resp.data);
-        // Show a chat bubble from the "app" with ingestion info
+
+        removeTask('Doc Ingestion');
         setMessages((prev) => [
           ...prev,
           {
             id: `doc-ingest-${Date.now()}`,
             role: 'app',
             type: 'text',
-            content: `Doc Ingested => ID=${resp.data.doc_id}, Desc="${resp.data.description}"`,
+            content: `Ingested doc_id=${resp.data.doc_id}, desc="${resp.data.description}"`,
           },
         ]);
       } catch (error: any) {
@@ -333,21 +275,20 @@ function HomeScreen({ navigation }: any) {
       return;
     }
 
-    // 2) If image => /api/image_recognize
+    // 2) Image
     if (selectedImageUri) {
-      // local UI for user
       const trimmed = textMessage.trim();
       if (trimmed) {
         setMessages((prev) => [
           ...prev,
           {
-            id: `user-txt-${Date.now()}`,
+            id: `${Date.now()}-text`,
             role: 'user',
             type: 'text',
             content: trimmed,
           },
           {
-            id: `user-img-${Date.now()}`,
+            id: `${Date.now()}-img`,
             role: 'user',
             type: 'image',
             content: selectedImageUri,
@@ -357,7 +298,7 @@ function HomeScreen({ navigation }: any) {
         setMessages((prev) => [
           ...prev,
           {
-            id: `user-img-${Date.now()}`,
+            id: `${Date.now()}-img`,
             role: 'user',
             type: 'image',
             content: selectedImageUri,
@@ -365,99 +306,78 @@ function HomeScreen({ navigation }: any) {
         ]);
       }
 
-      addTask('Image Recognition');
-      try {
-        const formData = new FormData();
-        formData.append('file', {
-          uri: selectedImageUri,
-          type: 'image/jpeg',
-          name: 'photo.jpg',
-        } as any);
-        formData.append('user_prompt', trimmed); // optional user text
-        formData.append('model', imageModel);    // e.g. "gpt-4o-mini"
+      addTask('Image Upload');
+      const formData = new FormData();
+      formData.append('model', imageModel);
+      formData.append('message', trimmed);
+      formData.append('file', {
+        uri: selectedImageUri,
+        type: 'image/jpeg',
+        name: 'photo.jpg',
+      } as any);
 
-        const resp = await axios.post(BACKEND_IMAGE_RECOGNIZE_URL, formData, {
+      setTextMessage('');
+      setSelectedImageUri(null);
+
+      try {
+        const resp = await axios.post(BACKEND_CHAT_URL, formData, {
           headers: { 'Content-Type': 'multipart/form-data' },
         });
-        removeTask('Image Recognition');
+        removeTask('Image Upload');
 
-        const { title, description, response } = resp.data;
-        // We show all three in separate bubbles for prototyping
-        if (title && title.trim()) {
-          setMessages((prev) => [
-            ...prev,
-            {
-              id: `app-imgtitle-${Date.now()}`,
-              role: 'app',
-              type: 'text',
-              content: `<Title>${title}</Title>`,
-            },
-          ]);
+        const reply = resp.data.response || '(No response)';
+        if (speakerOn) {
+          Tts.speak(reply);
         }
-        if (description && description.trim()) {
-          setMessages((prev) => [
-            ...prev,
-            {
-              id: `app-imgdesc-${Date.now()}`,
-              role: 'app',
-              type: 'text',
-              content: `<Description>${description}</Description>`,
-            },
-          ]);
-        }
-        const finalResp = response || '(No response)';
         setMessages((prev) => [
           ...prev,
           {
-            id: `app-imgresp-${Date.now()}`,
+            id: `app-${Date.now()}`,
             role: 'app',
             type: 'text',
-            content: `<Response>${finalResp}</Response>`,
+            content: reply,
           },
         ]);
-        if (speakerOn) Tts.speak(finalResp);
       } catch (error: any) {
-        removeTask('Image Recognition');
+        removeTask('Image Upload');
         const msg = error?.message || '(Network error)';
-        addError(`Image recognition failed: ${msg}`);
+        addError(`Image upload failed: ${msg}`);
         console.log('Error sending image:', error);
       }
-      setSelectedImageUri(null);
-      setTextMessage('');
       return;
     }
 
-    // 3) else => normal text => /api/chat
-    const trimmed = textMessage.trim();
-    if (!trimmed) return;
+    // 3) Text only
+    const trimmedMsg = textMessage.trim();
+    if (!trimmedMsg) return;
 
-    // local UI
-    const userMsgId = `user-msg-${Date.now()}`;
     setMessages((prev) => [
       ...prev,
       {
-        id: userMsgId,
+        id: `user-msg-${Date.now()}`,
         role: 'user',
         type: 'text',
-        content: trimmed,
+        content: trimmedMsg,
       },
     ]);
 
     addTask('Chat Request');
+    const formData = new FormData();
+    formData.append('model', textModel);
+    formData.append('message', trimmedMsg);
+
+    setTextMessage('');
+
     try {
-      const formData = new FormData();
-      formData.append('model', textModel); // e.g. "gpt-3.5-turbo"
-      formData.append('message', trimmed);
-
-      setTextMessage('');
-
       const resp = await axios.post(BACKEND_CHAT_URL, formData, {
         headers: { 'Content-Type': 'multipart/form-data' },
       });
       removeTask('Chat Request');
 
       const reply = resp.data.response || '(No response)';
-      if (speakerOn) Tts.speak(reply);
+      if (speakerOn) {
+        Tts.speak(reply);
+      }
       setMessages((prev) => [
         ...prev,
         {
@@ -471,16 +391,20 @@ function HomeScreen({ navigation }: any) {
       removeTask('Chat Request');
       const msg = error?.message || '(Network error)';
       addError(`Chat request failed: ${msg}`);
-      console.log('Error sending text chat:', error);
+      console.log('Error sending message:', error);
     }
   };
 
-  // ===================== SPEAKER TOGGLE =====================
-  function toggleSpeaker() {
+  //========================================
+  // Speaker Toggle
+  //========================================
+  const toggleSpeaker = () => {
     setSpeakerOn((prev) => !prev);
-  }
+  };
 
-  // ===================== RENDER CHAT MESSAGES =====================
+  //========================================
+  // Render Chat Messages
+  //========================================
   const renderMessage = ({ item }: { item: any }) => {
     const isUser = item.role === 'user';
     const bubbleStyle = isUser
@@ -502,9 +426,12 @@ function HomeScreen({ navigation }: any) {
     );
   };
 
-  // ===================== MAIN RENDER =====================
+  //========================================
+  // Main Render
+  //========================================
   return (
     <View style={styles.container}>
+      {/* Chat List */}
       <FlatList
         data={messages}
         renderItem={renderMessage}
@@ -513,13 +440,12 @@ function HomeScreen({ navigation }: any) {
         style={styles.chatList}
       />
 
-      {/* If doc selected */}
+      {/* File Previews (unchanged) */}
       {selectedDoc && (
         <View style={styles.selectedFilePreview}>
           <Text style={{ color: 'gray' }}>{`Doc attached: ${selectedDoc.name}`}</Text>
         </View>
       )}
-      {/* If image selected */}
       {selectedImageUri && (
         <View style={styles.selectedFilePreview}>
           <Image
@@ -530,8 +456,9 @@ function HomeScreen({ navigation }: any) {
         </View>
       )}
 
-      {/* Bottom row */}
+      {/* Bottom Buttons Row */}
       <View style={styles.buttonsRow}>
+        {/* Settings */}
         <TouchableOpacity
           style={styles.iconButton}
           onPress={() => navigation.navigate('Settings')}
@@ -539,24 +466,32 @@ function HomeScreen({ navigation }: any) {
           <MaterialCommunityIcons name="cog-outline" size={30} color="#fff" />
         </TouchableOpacity>
 
-        <TouchableOpacity style={styles.iconButton} onPress={toggleAttachMenu}>
-          <MaterialCommunityIcons name="paperclip" size={25} color="#fff" />
-        </TouchableOpacity>
-        {showAttachMenu && (
-          <View style={styles.attachSubMenu}>
-            <TouchableOpacity style={styles.subButton} onPress={handlePickDoc}>
-              <MaterialCommunityIcons name="file-document" size={24} color="#fff" />
-            </TouchableOpacity>
-            <TouchableOpacity style={styles.subButton} onPress={handleTakePhoto}>
-              <MaterialCommunityIcons name="camera" size={24} color="#fff" />
-            </TouchableOpacity>
-            <TouchableOpacity style={styles.subButton} onPress={handleChooseFromGallery}>
-              <MaterialCommunityIcons name="folder-image" size={24} color="#fff" />
-            </TouchableOpacity>
-          </View>
-        )}
+        {/* Single Attach Button w/ sub-menu */}
+        <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+          <TouchableOpacity
+            style={styles.iconButton}
+            onPress={toggleAttachMenu}
+          >
+            <MaterialCommunityIcons name="paperclip" size={25} color="#fff" />
+          </TouchableOpacity>
 
-        {/* Status button */}
+          {/* Sub-menu for doc/camera/gallery */}
+          {showAttachMenu && (
+            <View style={styles.attachSubMenu}>
+              <TouchableOpacity style={styles.subButton} onPress={handlePickDoc}>
+                <MaterialCommunityIcons name="file-document" size={24} color="#fff" />
+              </TouchableOpacity>
+              <TouchableOpacity style={styles.subButton} onPress={handleTakePhoto}>
+                <MaterialCommunityIcons name="camera" size={24} color="#fff" />
+              </TouchableOpacity>
+              <TouchableOpacity style={styles.subButton} onPress={handleChooseFromGallery}>
+                <MaterialCommunityIcons name="folder-image" size={24} color="#fff" />
+              </TouchableOpacity>
+            </View>
+          )}
+        </View>
+
+        {/* Status Button */}
         <TouchableOpacity
           style={[styles.iconButton, getStatusButtonStyle()]}
           onPress={toggleStatusPopup}
@@ -568,18 +503,18 @@ function HomeScreen({ navigation }: any) {
           />
         </TouchableOpacity>
 
-        {/* Speaker toggle */}
+        {/* Speaker Toggle */}
         <TouchableOpacity
           style={[
             styles.iconButton,
-            speakerOn ? { backgroundColor: 'green' } : { backgroundColor: 'red' },
+            { backgroundColor: speakerOn ? 'green' : 'red' },
           ]}
           onPress={toggleSpeaker}
         >
           <MaterialCommunityIcons name="volume-high" size={30} color="#fff" />
         </TouchableOpacity>
 
-        {/* Microphone */}
+        {/* Microphone (rightmost) */}
         <TouchableOpacity
           style={[styles.iconButton, recording && styles.recording]}
           onPress={recording ? stopRecording : startRecording}
@@ -588,7 +523,7 @@ function HomeScreen({ navigation }: any) {
         </TouchableOpacity>
       </View>
 
-      {/* Input row */}
+      {/* Input Row */}
       <View style={styles.inputRow}>
         <TextInput
           style={styles.textInput}
@@ -601,7 +536,7 @@ function HomeScreen({ navigation }: any) {
         </TouchableOpacity>
       </View>
 
-      {/* Status Popup */}
+      {/* Status Popup Modal */}
       <Modal
         visible={showStatusPopup}
         transparent
@@ -622,11 +557,9 @@ function HomeScreen({ navigation }: any) {
               </Text>
             ))}
 
-            <Text style={[styles.popupSubTitle, { marginTop: 10 }]}>
-              Errors:
-            </Text>
+            <Text style={[styles.popupSubTitle, { marginTop: 10 }]}>Errors:</Text>
             {errors.length === 0 && (
-              <Text style={styles.popupText}>No errors.</Text>
+              <Text style={[styles.popupText]}>No errors.</Text>
             )}
             {errors.map((e, idx) => (
               <Text key={idx} style={[styles.popupText, { color: 'red' }]}>
@@ -634,7 +567,7 @@ function HomeScreen({ navigation }: any) {
               </Text>
             ))}
 
-            {/* Popup close / clear */}
+            {/* Close / Clear errors */}
             <View style={styles.popupButtonsRow}>
               <TouchableOpacity
                 style={styles.popupButton}
@@ -658,7 +591,9 @@ function HomeScreen({ navigation }: any) {
 
 export default HomeScreen;
 
-// ===================== STYLES =====================
+//==============================================
+// Styles
+//==============================================
 const styles = StyleSheet.create({
   container: {
     flex: 1,
@@ -694,12 +629,15 @@ const styles = StyleSheet.create({
     height: 150,
     borderRadius: 8,
   },
+
+  // File/Doc preview
   selectedFilePreview: {
     flexDirection: 'row',
     alignItems: 'center',
     marginLeft: 8,
     marginBottom: 5,
   },
+
   buttonsRow: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -715,6 +653,10 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     marginHorizontal: 5,
   },
+  recording: {
+    backgroundColor: 'red',
+  },
+  // Sub-menu for attach
   attachSubMenu: {
     flexDirection: 'row',
     marginLeft: 5,
@@ -728,9 +670,8 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     marginHorizontal: 3,
   },
-  recording: {
-    backgroundColor: 'red',
-  },
+
+  // Input row
   inputRow: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -753,6 +694,8 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     alignItems: 'center',
   },
+
+  // Modal overlay
   overlay: {
     flex: 1,
     backgroundColor: 'rgba(0,0,0,0.4)',

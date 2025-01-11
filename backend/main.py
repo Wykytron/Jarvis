@@ -1,161 +1,253 @@
-# main.py
 from fastapi import FastAPI, UploadFile, File, Form, Body
 import os
-from dotenv import load_dotenv
 import openai
-import uuid
-import tempfile
-import whisper
 import base64
-from io import BytesIO
-import re  # for removing file extension
+import uuid
+import re
+from dotenv import load_dotenv
+from datetime import datetime
 
 from database import SessionLocal, ChatExchange, Document
 from vectorstore import ingest_document, query_docs
-from parser_utils import parse_file, parse_url
+from parser_utils import parse_file
 
 from openai import OpenAI
 
 load_dotenv()
 openai.api_key = os.getenv("OPENAI_API_KEY")
-print("DEBUG KEY:", openai.api_key)
 
 app = FastAPI()
 
-# --------------------
-# TRANSCRIBE
-# --------------------
-@app.post("/api/transcribe")
-async def transcribe_audio(
+
+# -------------------------------------------------------------
+# 1) /api/image_recognize
+#    Provide the image via "content_parts" + a system message
+#    that demands <Title>, <Description>, <Response>.
+# -------------------------------------------------------------
+@app.post("/api/image_recognize")
+async def image_recognize_endpoint(
     file: UploadFile = File(...),
-    whisper_model: str = Form("base")
-):
-    audio_bytes = await file.read()
-    temp_dir = tempfile.gettempdir()
-    temp_id = str(uuid.uuid4())
-    temp_path = os.path.join(temp_dir, f"{temp_id}.wav")
-
-    with open(temp_path, "wb") as f:
-        f.write(audio_bytes)
-
-    model_w = whisper.load_model(whisper_model)
-    result = model_w.transcribe(temp_path)
-
-    os.remove(temp_path)
-    return {"transcript": result["text"]}
-
-
-# --------------------
-# CHAT (unchanged logic for images)
-# --------------------
-@app.post("/api/chat")
-async def chat_endpoint(
-    message: str = Form(...),
-    model: str = Form("gpt-4o-mini"),
-    file: UploadFile = File(None)
+    user_prompt: str = Form(""),
+    model: str = Form("gpt-4o-mini")
 ):
     """
-    EXACT old snippet with content_parts for images
-    but using the new library call (client.chat.completions.create).
+    Reimplements your old snippet but also ensures the system
+    message instructs the model to produce <Title>, <Description>, <Response>.
+    
+    1) We pass content_parts with (text + image_url).
+    2) We also add a system message with strict formatting instructions.
+    3) The model should return the triple fields, which we parse via regex.
+    4) We store them in ChatExchange + doc table (embedding the image desc).
     """
-    content_parts = [
-        {"type": "text", "text": message.strip()}
-    ]
-    if file is not None:
-        image_bytes = await file.read()
-        b64_str = base64.b64encode(image_bytes).decode("utf-8")
+    db = SessionLocal()
+    try:
+        # (A) Base64-encode the image
+        raw_img = await file.read()
+        user_image_b64 = base64.b64encode(raw_img).decode("utf-8")
+
+        # (B) Build content_parts (like your old approach)
+        content_parts = []
+        if user_prompt.strip():
+            content_parts.append({
+                "type": "text",
+                "text": user_prompt.strip()
+            })
         content_parts.append({
             "type": "image_url",
             "image_url": {
-                "url": f"data:image/jpeg;base64,{b64_str}"
+                "url": f"data:image/jpeg;base64,{user_image_b64}"
             }
         })
 
-    client = OpenAI(api_key=openai.api_key)  # same new library approach
-    try:
-        response = client.chat.completions.create(
-            model=model,
-            messages=[
-                {
-                    "role": "user",
-                    "content": content_parts
-                }
-            ],
+        # (C) Prepare the system instruction to ensure the model
+        #     outputs <Title>, <Description>, <Response>.
+        instructions = (
+            "You are an expert image recognition AI. The user may provide a prompt + image.\n"
+            "You MUST return the results in this EXACT format:\n"
+            "<Title>...</Title>\n"
+            "<Description>...</Description>\n"
+            "<Response>...</Response>\n"
+            "Where:\n"
+            "- <Title> is a short name for the image.\n"
+            "- <Description> is a factual description of the image.\n"
+            "- <Response> addresses the user's prompt or question about the image.\n"
         )
-        llm_message = response.choices[0].message.content
-    except Exception as e:
-        print("Error calling GPT model:", e)
-        llm_message = "(Error calling model.)"
 
-    db = SessionLocal()
-    try:
-        new_exchange = ChatExchange(
-            user_message=message,
-            llm_response=llm_message
+        # (D) Call your custom model: system message + user content_parts
+        client = OpenAI(api_key=openai.api_key)
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": instructions},
+                    {"role": "user", "content": content_parts}
+                ],
+                max_tokens=400,
+                temperature=0.7
+            )
+            llm_text = response.choices[0].message.content or ""
+        except Exception as e:
+            print("Error calling image model:", e)
+            return {"error": f"Model call failed: {str(e)}"}
+
+        # (E) Parse out <Title>, <Description>, <Response>
+        title_match = re.search(r"<Title>(.*?)</Title>", llm_text, re.DOTALL)
+        desc_match = re.search(r"<Description>(.*?)</Description>", llm_text, re.DOTALL)
+        resp_match = re.search(r"<Response>(.*?)</Response>", llm_text, re.DOTALL)
+
+        image_title = title_match.group(1).strip() if title_match else ""
+        image_desc = desc_match.group(1).strip() if desc_match else ""
+        final_response = resp_match.group(1).strip() if resp_match else llm_text
+
+        # (F) Save to DB (ChatExchange)
+        new_ex = ChatExchange(
+            user_message=user_prompt,
+            llm_response=final_response,
+            user_image_b64=user_image_b64,   # store the raw image
+            image_title=image_title,
+            image_description=image_desc
         )
-        db.add(new_exchange)
+        db.add(new_ex)
         db.commit()
-        db.refresh(new_exchange)
+        db.refresh(new_ex)
+
+        # (G) Also store the image description in Documents => vector store
+        new_doc = Document(
+            filename=f"image_{new_ex.id}.jpg",
+            file_content=raw_img,
+            text_content=image_desc,
+            description=image_title
+        )
+        db.add(new_doc)
+        db.commit()
+        db.refresh(new_doc)
+
+        if image_desc.strip():
+            ingest_document(new_doc.id, image_desc)
+
+        return {
+            "title": image_title,
+            "description": image_desc,
+            "response": final_response,
+            "exchange_id": new_ex.id
+        }
+
     finally:
         db.close()
 
-    return {"response": llm_message}
+
+# -------------------------------------------------------------
+# 2) /api/chat => text-only short-term memory
+# -------------------------------------------------------------
+@app.post("/api/chat")
+async def chat_endpoint(
+    message: str = Form(...),
+    model: str = Form("gpt-3.5-turbo")
+):
+    """
+    If user only sends text => short-term memory approach.
+    If old exchange had image_description, we pass it as "previous image desc".
+    """
+    ROLLING_WINDOW_SIZE = 5
+    db = SessionLocal()
+    try:
+        old_exs = db.query(ChatExchange) \
+            .order_by(ChatExchange.timestamp.desc()) \
+            .limit(ROLLING_WINDOW_SIZE).all()
+        old_exs.reverse()
+
+        system_msg = {
+            "role": "system",
+            "content": "You are a helpful text-based assistant with short memory of last user messages."
+        }
+        conversation = [system_msg]
+
+        for exch in old_exs:
+            # user text
+            user_txt = exch.user_message.strip() if exch.user_message else ""
+            if exch.image_description and exch.image_description.strip():
+                user_txt += f"\n[Previous Image Description: {exch.image_description.strip()}]"
+            
+            if user_txt.strip():
+                conversation.append({"role": "user", "content": user_txt})
+
+            # assistant text
+            if exch.llm_response and exch.llm_response.strip():
+                conversation.append({"role": "assistant", "content": exch.llm_response.strip()})
+
+        # new user text
+        conversation.append({"role": "user", "content": message.strip()})
+
+        client = OpenAI(api_key=openai.api_key)
+        try:
+            resp = client.chat.completions.create(
+                model=model,
+                messages=conversation,
+                max_tokens=400,
+                temperature=0.7
+            )
+            llm_msg = resp.choices[0].message.content
+        except Exception as e:
+            print("Error calling text model:", e)
+            llm_msg = "(Error calling text model.)"
+
+        # store
+        new_ex = ChatExchange(
+            user_message=message,
+            llm_response=llm_msg
+        )
+        db.add(new_ex)
+        db.commit()
+        db.refresh(new_ex)
+
+        return {"response": llm_msg}
+    finally:
+        db.close()
 
 
-# --------------------
-# HISTORY
-# --------------------
+# -------------------------------------------------------------
+# 3) /api/history => fetch full chat with images
+# -------------------------------------------------------------
 @app.get("/api/history")
 def get_chat_history():
     db = SessionLocal()
     try:
-        exchanges = db.query(ChatExchange).order_by(ChatExchange.timestamp.asc()).all()
-        history = [
-            {
-                "id": exch.id,
-                "user_message": exch.user_message,
-                "llm_response": exch.llm_response,
-                "timestamp": exch.timestamp.isoformat()
+        rows = db.query(ChatExchange).order_by(ChatExchange.timestamp.asc()).all()
+        hist = []
+        for r in rows:
+            item = {
+                "id": r.id,
+                "timestamp": r.timestamp.isoformat(),
+                "user_message": r.user_message or "",
+                "llm_response": r.llm_response or ""
             }
-            for exch in exchanges
-        ]
-        return {"history": history}
+            if r.user_image_b64:
+                item["user_image_b64"] = r.user_image_b64
+            if r.image_title:
+                item["image_title"] = r.image_title
+            if r.image_description:
+                item["image_description"] = r.image_description
+            hist.append(item)
+        return {"history": hist}
     finally:
         db.close()
 
 
-# --------------------
-# INGEST
-# --------------------
+# -------------------------------------------------------------
+# 4) /api/ingest => doc ingestion
+# -------------------------------------------------------------
 @app.post("/api/ingest")
 async def ingest_endpoint(
-    file: UploadFile = File(None),
-    url: str = Form(None),
+    file: UploadFile = File(...),
     description: str = Form(None)
 ):
-    """
-    Accept either a file or a url, plus an optional description.
-    If user doesn't provide a description, we auto-set it to the filename (minus extension).
-    """
-    if url:
-        # parse url text
-        text_content = parse_url(url)
-        raw_bytes = text_content.encode("utf-8", errors="ignore")
-        filename = f"webpage-{uuid.uuid4()}.html"
-    elif file:
-        raw_bytes = await file.read()
-        extension = file.filename.split(".")[-1].lower() if file.filename else "txt"
-        text_content = parse_file(raw_bytes, extension)
-        filename = file.filename or f"unknown-{uuid.uuid4()}"
-    else:
-        return {"error": "Must provide either 'file' or 'url'."}
+    raw_bytes = await file.read()
+    filename = file.filename or f"unknown-{uuid.uuid4()}"
+    extension = filename.rsplit(".",1)[-1].lower()
+    text_content = parse_file(raw_bytes, extension)
 
-    # If no description or user typed nothing,
-    # let's set description = filename minus extension
-    if (not description) or (not description.strip()):
-        # remove extension with a regex or rsplit
-        # e.g. "file.pdf" => "file"
-        base_name = filename.rsplit(".", 1)[0]
+    if not description or not description.strip():
+        base_name = filename.rsplit(".",1)[0]
         description = base_name
 
     db = SessionLocal()
@@ -178,16 +270,16 @@ async def ingest_endpoint(
             "status": "ok",
             "doc_id": doc_id,
             "filename": filename,
-            "text_length": len(text_content),
-            "description": description
+            "description": description,
+            "text_length": len(text_content)
         }
     finally:
         db.close()
 
 
-# --------------------
-# SEARCH DOCS
-# --------------------
+# -------------------------------------------------------------
+# 5) /api/search_docs => vector search
+# -------------------------------------------------------------
 @app.post("/api/search_docs")
 def search_docs_endpoint(
     query: str = Body(..., embed=True),
