@@ -59,7 +59,7 @@ async def image_recognize_endpoint(
 
         # (C) System message: demand Title, Description, Response
         instructions = (
-            "You are an expert image recognition AI. The user may provide a prompt + image.\n"
+            "You are an expert image recognition AI. The user may provide a prompt + image. If no additional prompt is provided, put something like 'How can i help you with this image?' into the <Response> section. \n"
             "You MUST return the results in this EXACT format:\n"
             "<Title>...</Title>\n"
             "<Description>...</Description>\n"
