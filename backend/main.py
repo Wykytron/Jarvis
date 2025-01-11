@@ -1,3 +1,4 @@
+# main.py
 from fastapi import FastAPI, UploadFile, File, Form, Body
 import os
 import openai
@@ -21,8 +22,8 @@ app = FastAPI()
 
 # -------------------------------------------------------------
 # 1) /api/image_recognize
-#    Provide the image via "content_parts" + a system message
-#    that demands <Title>, <Description>, <Response>.
+#    Provide the image via "content_parts" + system message
+#    => always produce <Title>, <Description>, <Response>.
 # -------------------------------------------------------------
 @app.post("/api/image_recognize")
 async def image_recognize_endpoint(
@@ -31,13 +32,10 @@ async def image_recognize_endpoint(
     model: str = Form("gpt-4o-mini")
 ):
     """
-    Reimplements your old snippet but also ensures the system
-    message instructs the model to produce <Title>, <Description>, <Response>.
-    
-    1) We pass content_parts with (text + image_url).
-    2) We also add a system message with strict formatting instructions.
-    3) The model should return the triple fields, which we parse via regex.
-    4) We store them in ChatExchange + doc table (embedding the image desc).
+    1) We pass content_parts to the model so it can 'see' the image (like your old snippet).
+    2) We also add a system instruction requiring <Title>, <Description>, <Response>.
+    3) The model returns them, which we parse & store in DB.
+    4) We always return them in the response so the frontend can display each.
     """
     db = SessionLocal()
     try:
@@ -45,7 +43,7 @@ async def image_recognize_endpoint(
         raw_img = await file.read()
         user_image_b64 = base64.b64encode(raw_img).decode("utf-8")
 
-        # (B) Build content_parts (like your old approach)
+        # (B) Build content_parts (like old approach)
         content_parts = []
         if user_prompt.strip():
             content_parts.append({
@@ -59,8 +57,7 @@ async def image_recognize_endpoint(
             }
         })
 
-        # (C) Prepare the system instruction to ensure the model
-        #     outputs <Title>, <Description>, <Response>.
+        # (C) System message: demand Title, Description, Response
         instructions = (
             "You are an expert image recognition AI. The user may provide a prompt + image.\n"
             "You MUST return the results in this EXACT format:\n"
@@ -73,7 +70,7 @@ async def image_recognize_endpoint(
             "- <Response> addresses the user's prompt or question about the image.\n"
         )
 
-        # (D) Call your custom model: system message + user content_parts
+        # (D) Call your custom model
         client = OpenAI(api_key=openai.api_key)
         try:
             response = client.chat.completions.create(
@@ -87,10 +84,10 @@ async def image_recognize_endpoint(
             )
             llm_text = response.choices[0].message.content or ""
         except Exception as e:
-            print("Error calling image model:", e)
+            print("Error calling the image model:", e)
             return {"error": f"Model call failed: {str(e)}"}
 
-        # (E) Parse out <Title>, <Description>, <Response>
+        # (E) Parse <Title>, <Description>, <Response>
         title_match = re.search(r"<Title>(.*?)</Title>", llm_text, re.DOTALL)
         desc_match = re.search(r"<Description>(.*?)</Description>", llm_text, re.DOTALL)
         resp_match = re.search(r"<Response>(.*?)</Response>", llm_text, re.DOTALL)
@@ -103,7 +100,7 @@ async def image_recognize_endpoint(
         new_ex = ChatExchange(
             user_message=user_prompt,
             llm_response=final_response,
-            user_image_b64=user_image_b64,   # store the raw image
+            user_image_b64=user_image_b64,
             image_title=image_title,
             image_description=image_desc
         )
@@ -111,7 +108,7 @@ async def image_recognize_endpoint(
         db.commit()
         db.refresh(new_ex)
 
-        # (G) Also store the image description in Documents => vector store
+        # (G) Also store + embed the image_desc as doc
         new_doc = Document(
             filename=f"image_{new_ex.id}.jpg",
             file_content=raw_img,
@@ -146,7 +143,8 @@ async def chat_endpoint(
 ):
     """
     If user only sends text => short-term memory approach.
-    If old exchange had image_description, we pass it as "previous image desc".
+    We'll fetch last N from DB, passing any 'image_description'
+    from previous images as additional user text, so the LLM knows context.
     """
     ROLLING_WINDOW_SIZE = 5
     db = SessionLocal()
@@ -158,12 +156,11 @@ async def chat_endpoint(
 
         system_msg = {
             "role": "system",
-            "content": "You are a helpful text-based assistant with short memory of last user messages."
+            "content": "You are a helpful text-based assistant. You recall the last few messages."
         }
         conversation = [system_msg]
 
         for exch in old_exs:
-            # user text
             user_txt = exch.user_message.strip() if exch.user_message else ""
             if exch.image_description and exch.image_description.strip():
                 user_txt += f"\n[Previous Image Description: {exch.image_description.strip()}]"
@@ -171,7 +168,6 @@ async def chat_endpoint(
             if user_txt.strip():
                 conversation.append({"role": "user", "content": user_txt})
 
-            # assistant text
             if exch.llm_response and exch.llm_response.strip():
                 conversation.append({"role": "assistant", "content": exch.llm_response.strip()})
 
@@ -206,7 +202,7 @@ async def chat_endpoint(
 
 
 # -------------------------------------------------------------
-# 3) /api/history => fetch full chat with images
+# 3) /api/history => returns text + optional image
 # -------------------------------------------------------------
 @app.get("/api/history")
 def get_chat_history():

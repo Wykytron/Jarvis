@@ -1,4 +1,5 @@
 // frontend/screens/HomeScreen.tsx
+
 import React, { useState, useEffect, useContext } from 'react';
 import {
   View,
@@ -25,7 +26,9 @@ import DocumentPicker, { types } from 'react-native-document-picker';
 
 import { ModelContext } from '../ModelContext';
 
-// ==================== BACKEND URLS =====================
+// --------------------------------------
+// BACKEND ENDPOINTS
+// --------------------------------------
 const BACKEND_URL = 'http://192.168.0.189:8000';
 const BACKEND_TRANSCRIBE_URL = `${BACKEND_URL}/api/transcribe`;
 const BACKEND_CHAT_URL = `${BACKEND_URL}/api/chat`;
@@ -33,7 +36,9 @@ const BACKEND_INGEST_URL = `${BACKEND_URL}/api/ingest`;
 const BACKEND_IMAGE_RECOGNIZE_URL = `${BACKEND_URL}/api/image_recognize`;
 const BACKEND_HISTORY_URL = `${BACKEND_URL}/api/history`;
 
-// ==================== COMPONENT ========================
+// --------------------------------------
+// HomeScreen
+// --------------------------------------
 function HomeScreen({ navigation }: any) {
   const { textModel, imageModel, whisperModel } = useContext(ModelContext);
 
@@ -51,21 +56,22 @@ function HomeScreen({ navigation }: any) {
     type: string;
   } | null>(null);
 
-  // The typed text input
+  // Typed text input
   const [textMessage, setTextMessage] = useState('');
-
   // Speaker toggle
   const [speakerOn, setSpeakerOn] = useState(false);
 
   // Attach menu toggle
   const [showAttachMenu, setShowAttachMenu] = useState(false);
 
-  // Manage tasks & errors for a status popup
+  // Tasks & errors for status popup
   const [tasksInProgress, setTasksInProgress] = useState<string[]>([]);
   const [errors, setErrors] = useState<string[]>([]);
   const [showStatusPopup, setShowStatusPopup] = useState(false);
 
-  // ===================== USE EFFECT: Fetch History on Mount =====================
+  // --------------------------------------
+  // On mount: fetch chat history
+  // --------------------------------------
   useEffect(() => {
     MaterialCommunityIcons.loadFont();
     fetchHistory();
@@ -79,7 +85,7 @@ function HomeScreen({ navigation }: any) {
       const loaded: any[] = [];
 
       history.forEach((ex: any) => {
-        // If user_message is present
+        // user text
         if (ex.user_message && ex.user_message.trim()) {
           loaded.push({
             id: ex.id + '-user-text',
@@ -88,7 +94,7 @@ function HomeScreen({ navigation }: any) {
             content: ex.user_message.trim(),
           });
         }
-        // If there's an image
+        // user image (if present)
         if (ex.user_image_b64) {
           loaded.push({
             id: ex.id + '-user-img',
@@ -97,25 +103,25 @@ function HomeScreen({ navigation }: any) {
             content: `data:image/jpeg;base64,${ex.user_image_b64}`,
           });
         }
-        // If there's an image title
+        // image title
         if (ex.image_title && ex.image_title.trim()) {
           loaded.push({
-            id: ex.id + '-user-imgtitle',
+            id: ex.id + '-imgtitle',
             role: 'app',
             type: 'text',
             content: `<Title>${ex.image_title.trim()}</Title>`,
           });
         }
-        // If there's an image description
+        // image description
         if (ex.image_description && ex.image_description.trim()) {
           loaded.push({
-            id: ex.id + '-user-imgdesc',
+            id: ex.id + '-imgdesc',
             role: 'app',
             type: 'text',
             content: `<Description>${ex.image_description.trim()}</Description>`,
           });
         }
-        // If assistant message
+        // assistant text
         if (ex.llm_response && ex.llm_response.trim()) {
           loaded.push({
             id: ex.id + '-assistant',
@@ -134,7 +140,9 @@ function HomeScreen({ navigation }: any) {
     }
   }
 
-  // ===================== TASKS & ERRORS LOGIC =====================
+  // --------------------------------------
+  // Task & error helpers
+  // --------------------------------------
   function addTask(label: string) {
     setTasksInProgress((prev) => [...prev, label]);
     console.log('>>> addTask:', label);
@@ -170,7 +178,9 @@ function HomeScreen({ navigation }: any) {
     return 'information-outline';
   }
 
-  // ===================== AUDIO RECORDING =====================
+  // --------------------------------------
+  // AUDIO RECORDING
+  // --------------------------------------
   async function requestPermissions() {
     try {
       await PermissionsAndroid.requestMultiple([
@@ -235,12 +245,16 @@ function HomeScreen({ navigation }: any) {
     }
   };
 
-  // ===================== ATTACH MENU =====================
+  // --------------------------------------
+  // ATTACH MENU
+  // --------------------------------------
   function toggleAttachMenu() {
     setShowAttachMenu(!showAttachMenu);
   }
 
-  // ===================== CAMERA / GALLERY / DOC =====================
+  // --------------------------------------
+  // CAMERA / GALLERY / DOC
+  // --------------------------------------
   const handleTakePhoto = async () => {
     toggleAttachMenu();
     const hasCam = await requestCameraPermission();
@@ -292,9 +306,14 @@ function HomeScreen({ navigation }: any) {
     }
   };
 
-  // ===================== SENDING (Doc => Image => Text) =====================
+  // --------------------------------------
+  // SEND MESSAGE
+  //  1) doc => /api/ingest
+  //  2) image => /api/image_recognize
+  //  3) text => /api/chat
+  // --------------------------------------
   const sendMessage = async () => {
-    // 1) If doc => /api/ingest
+    // 1) If doc
     if (selectedDoc) {
       addTask('Doc Ingestion');
       try {
@@ -312,7 +331,6 @@ function HomeScreen({ navigation }: any) {
         removeTask('Doc Ingestion');
 
         console.log('Doc ingestion resp:', resp.data);
-        // Show a chat bubble from the "app" with ingestion info
         setMessages((prev) => [
           ...prev,
           {
@@ -373,16 +391,19 @@ function HomeScreen({ navigation }: any) {
           type: 'image/jpeg',
           name: 'photo.jpg',
         } as any);
-        formData.append('user_prompt', trimmed); // optional user text
-        formData.append('model', imageModel);    // e.g. "gpt-4o-mini"
+        formData.append('user_prompt', trimmed);
+        formData.append('model', imageModel);
 
         const resp = await axios.post(BACKEND_IMAGE_RECOGNIZE_URL, formData, {
           headers: { 'Content-Type': 'multipart/form-data' },
         });
         removeTask('Image Recognition');
 
-        const { title, description, response } = resp.data;
-        // We show all three in separate bubbles for prototyping
+        // The backend returns {title, description, response}
+        const { title, description, response } = resp.data || {};
+        console.log('image_recognize resp:', resp.data);
+
+        // ALWAYS show Title, Description, and Response in separate bubbles
         if (title && title.trim()) {
           setMessages((prev) => [
             ...prev,
@@ -415,7 +436,9 @@ function HomeScreen({ navigation }: any) {
             content: `<Response>${finalResp}</Response>`,
           },
         ]);
-        if (speakerOn) Tts.speak(finalResp);
+        if (speakerOn) {
+          Tts.speak(finalResp);
+        }
       } catch (error: any) {
         removeTask('Image Recognition');
         const msg = error?.message || '(Network error)';
@@ -427,7 +450,7 @@ function HomeScreen({ navigation }: any) {
       return;
     }
 
-    // 3) else => normal text => /api/chat
+    // 3) Else => normal text => /api/chat
     const trimmed = textMessage.trim();
     if (!trimmed) return;
 
@@ -446,7 +469,7 @@ function HomeScreen({ navigation }: any) {
     addTask('Chat Request');
     try {
       const formData = new FormData();
-      formData.append('model', textModel); // e.g. "gpt-3.5-turbo"
+      formData.append('model', textModel);
       formData.append('message', trimmed);
 
       setTextMessage('');
@@ -475,12 +498,16 @@ function HomeScreen({ navigation }: any) {
     }
   };
 
-  // ===================== SPEAKER TOGGLE =====================
+  // --------------------------------------
+  // SPEAKER TOGGLE
+  // --------------------------------------
   function toggleSpeaker() {
     setSpeakerOn((prev) => !prev);
   }
 
-  // ===================== RENDER CHAT MESSAGES =====================
+  // --------------------------------------
+  // RENDER MESSAGES
+  // --------------------------------------
   const renderMessage = ({ item }: { item: any }) => {
     const isUser = item.role === 'user';
     const bubbleStyle = isUser
@@ -502,7 +529,9 @@ function HomeScreen({ navigation }: any) {
     );
   };
 
-  // ===================== MAIN RENDER =====================
+  // --------------------------------------
+  // FINAL RENDER
+  // --------------------------------------
   return (
     <View style={styles.container}>
       <FlatList
@@ -513,13 +542,13 @@ function HomeScreen({ navigation }: any) {
         style={styles.chatList}
       />
 
-      {/* If doc selected */}
+      {/* Selected doc preview */}
       {selectedDoc && (
         <View style={styles.selectedFilePreview}>
           <Text style={{ color: 'gray' }}>{`Doc attached: ${selectedDoc.name}`}</Text>
         </View>
       )}
-      {/* If image selected */}
+      {/* Selected image preview */}
       {selectedImageUri && (
         <View style={styles.selectedFilePreview}>
           <Image
@@ -530,7 +559,7 @@ function HomeScreen({ navigation }: any) {
         </View>
       )}
 
-      {/* Bottom row */}
+      {/* Bottom buttons row */}
       <View style={styles.buttonsRow}>
         <TouchableOpacity
           style={styles.iconButton}
@@ -634,7 +663,7 @@ function HomeScreen({ navigation }: any) {
               </Text>
             ))}
 
-            {/* Popup close / clear */}
+            {/* Close / Clear */}
             <View style={styles.popupButtonsRow}>
               <TouchableOpacity
                 style={styles.popupButton}
@@ -658,7 +687,9 @@ function HomeScreen({ navigation }: any) {
 
 export default HomeScreen;
 
-// ===================== STYLES =====================
+// --------------------------------------
+// Styles
+// --------------------------------------
 const styles = StyleSheet.create({
   container: {
     flex: 1,
