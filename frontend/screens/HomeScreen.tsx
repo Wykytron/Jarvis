@@ -36,6 +36,9 @@ const BACKEND_INGEST_URL = `${BACKEND_URL}/api/ingest`;
 const BACKEND_IMAGE_RECOGNIZE_URL = `${BACKEND_URL}/api/image_recognize`;
 const BACKEND_HISTORY_URL = `${BACKEND_URL}/api/history`;
 
+// NEW: Agent endpoint
+const BACKEND_AGENT_URL = `${BACKEND_URL}/api/agent`;
+
 // --------------------------------------
 // HomeScreen
 // --------------------------------------
@@ -94,7 +97,7 @@ function HomeScreen({ navigation }: any) {
             content: ex.user_message.trim(),
           });
         }
-        // user image (if present)
+        // user image
         if (ex.user_image_b64) {
           loaded.push({
             id: ex.id + '-user-img',
@@ -307,10 +310,7 @@ function HomeScreen({ navigation }: any) {
   };
 
   // --------------------------------------
-  // SEND MESSAGE
-  //  1) doc => /api/ingest
-  //  2) image => /api/image_recognize
-  //  3) text => /api/chat
+  // Normal Chat / Doc / Image
   // --------------------------------------
   const sendMessage = async () => {
     // 1) If doc
@@ -353,7 +353,6 @@ function HomeScreen({ navigation }: any) {
 
     // 2) If image => /api/image_recognize
     if (selectedImageUri) {
-      // local UI for user
       const trimmed = textMessage.trim();
       if (trimmed) {
         setMessages((prev) => [
@@ -399,11 +398,9 @@ function HomeScreen({ navigation }: any) {
         });
         removeTask('Image Recognition');
 
-        // The backend returns {title, description, response}
         const { title, description, response } = resp.data || {};
         console.log('image_recognize resp:', resp.data);
 
-        // ALWAYS show Title, Description, and Response in separate bubbles
         if (title && title.trim()) {
           setMessages((prev) => [
             ...prev,
@@ -454,16 +451,10 @@ function HomeScreen({ navigation }: any) {
     const trimmed = textMessage.trim();
     if (!trimmed) return;
 
-    // local UI
     const userMsgId = `user-msg-${Date.now()}`;
     setMessages((prev) => [
       ...prev,
-      {
-        id: userMsgId,
-        role: 'user',
-        type: 'text',
-        content: trimmed,
-      },
+      { id: userMsgId, role: 'user', type: 'text', content: trimmed },
     ]);
 
     addTask('Chat Request');
@@ -483,12 +474,7 @@ function HomeScreen({ navigation }: any) {
       if (speakerOn) Tts.speak(reply);
       setMessages((prev) => [
         ...prev,
-        {
-          id: `app-msg-${Date.now()}`,
-          role: 'app',
-          type: 'text',
-          content: reply,
-        },
+        { id: `app-msg-${Date.now()}`, role: 'app', type: 'text', content: reply },
       ]);
     } catch (error: any) {
       removeTask('Chat Request');
@@ -497,6 +483,43 @@ function HomeScreen({ navigation }: any) {
       console.log('Error sending text chat:', error);
     }
   };
+
+  // --------------------------------------
+  // Agent call
+  // --------------------------------------
+  async function callAgentApi(userInput: string) {
+    if (!userInput.trim()) return;
+    addTask('Agent Request');
+    try {
+      const resp = await axios.post(`${BACKEND_URL}/api/agent`, {
+        user_input: textMessage.trim()
+      });
+      removeTask('Agent Request');
+
+      const { final_answer, debug_info } = resp.data;
+      console.log("Agent Debug Info:", debug_info);  // log to console
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: `agent-user-${Date.now()}`,
+          role: 'user',
+          type: 'text',
+          content: userInput,
+        },
+        {
+          id: `agent-answer-${Date.now()}`,
+          role: 'app',
+          type: 'text',
+          content: final_answer,
+        },
+      ]);
+    } catch (error: any) {
+      removeTask('Agent Request');
+      const msg = error?.message || '(Network error)';
+      addError(`Agent error: ${msg}`);
+      console.log('Error calling agent:', error);
+    }
+  }
 
   // --------------------------------------
   // SPEAKER TOGGLE
@@ -614,6 +637,19 @@ function HomeScreen({ navigation }: any) {
           onPress={recording ? stopRecording : startRecording}
         >
           <MaterialCommunityIcons name="microphone" size={30} color="#fff" />
+        </TouchableOpacity>
+
+        {/* NEW: Robot (Agent) Button */}
+        <TouchableOpacity
+          style={styles.iconButton}
+          onPress={() => {
+            if (textMessage.trim()) {
+              callAgentApi(textMessage.trim());
+              setTextMessage('');
+            }
+          }}
+        >
+          <MaterialCommunityIcons name="robot" size={30} color="#fff" />
         </TouchableOpacity>
       </View>
 

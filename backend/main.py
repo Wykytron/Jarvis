@@ -1,7 +1,6 @@
 # main.py
 from fastapi import FastAPI, UploadFile, File, Form, Body
 import os
-import openai
 import base64
 import uuid
 import re
@@ -12,18 +11,29 @@ from database import SessionLocal, ChatExchange, Document
 from vectorstore import ingest_document, query_docs
 from parser_utils import parse_file
 
-from openai import OpenAI
+# Import the orchestrator "run_agent"
+from agent.orchestrator import run_agent
+
+# We no longer call old openai.* directly. We'll create a client in your orchestrator.
+# So we don't do import openai here except for referencing openai.api_key if needed:
+import openai
+
+import logging
 
 load_dotenv()
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
 app = FastAPI()
 
+logging.basicConfig(
+    level=logging.INFO,            # or DEBUG
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
+
+logger = logging.getLogger("agent")
 
 # -------------------------------------------------------------
 # 1) /api/image_recognize
-#    Provide the image via "content_parts" + system message
-#    => always produce <Title>, <Description>, <Response>.
 # -------------------------------------------------------------
 @app.post("/api/image_recognize")
 async def image_recognize_endpoint(
@@ -32,10 +42,10 @@ async def image_recognize_endpoint(
     model: str = Form("gpt-4o-mini")
 ):
     """
-    1) We pass content_parts to the model so it can 'see' the image (like your old snippet).
+    1) We pass content_parts to the model so it can 'see' the image.
     2) We also add a system instruction requiring <Title>, <Description>, <Response>.
     3) The model returns them, which we parse & store in DB.
-    4) We always return them in the response so the frontend can display each.
+    4) We always return them for the frontend display.
     """
     db = SessionLocal()
     try:
@@ -43,46 +53,39 @@ async def image_recognize_endpoint(
         raw_img = await file.read()
         user_image_b64 = base64.b64encode(raw_img).decode("utf-8")
 
-        # (B) Build content_parts (like old approach)
+        # (B) Build content parts
         content_parts = []
         if user_prompt.strip():
-            content_parts.append({
-                "type": "text",
-                "text": user_prompt.strip()
-            })
+            content_parts.append({"type": "text", "text": user_prompt.strip()})
         content_parts.append({
             "type": "image_url",
-            "image_url": {
-                "url": f"data:image/jpeg;base64,{user_image_b64}"
-            }
+            "image_url": {"url": f"data:image/jpeg;base64,{user_image_b64}"}
         })
 
-        # (C) System message: demand Title, Description, Response
+        # (C) The instructions
         instructions = (
-            "You are an expert image recognition AI. The user may provide a prompt + image. If no additional prompt is provided, put something like 'How can i help you with this image?' into the <Response> section. \n"
-            "You MUST return the results in this EXACT format:\n"
-            "<Title>...</Title>\n"
-            "<Description>...</Description>\n"
-            "<Response>...</Response>\n"
-            "Where:\n"
-            "- <Title> is a short name for the image.\n"
-            "- <Description> is a factual description of the image.\n"
-            "- <Response> addresses the user's prompt or question about the image.\n"
+            "You are an expert image recognition AI. The user may provide a prompt + image. "
+            "If no additional prompt is provided, put something like 'How can i help you with this image?' "
+            "into the <Response> section.\n"
+            "Return EXACT:\n<Title>...</Title>\n<Description>...</Description>\n<Response>...</Response>\n"
         )
 
-        # (D) Call your custom model
+        # (D) Use the new interface. We'll create a client from openai directly.
+        # We can do a "from openai import OpenAI" pattern, or we can do minimal code here:
+        from openai import OpenAI
         client = OpenAI(api_key=openai.api_key)
+
         try:
-            response = client.chat.completions.create(
+            resp = client.chat.completions.create(
                 model=model,
                 messages=[
                     {"role": "system", "content": instructions},
-                    {"role": "user", "content": content_parts}
+                    {"role": "user", "content": content_parts},
                 ],
                 max_tokens=400,
                 temperature=0.7
             )
-            llm_text = response.choices[0].message.content or ""
+            llm_text = resp.choices[0].message.content or ""
         except Exception as e:
             print("Error calling the image model:", e)
             return {"error": f"Model call failed: {str(e)}"}
@@ -96,7 +99,7 @@ async def image_recognize_endpoint(
         image_desc = desc_match.group(1).strip() if desc_match else ""
         final_response = resp_match.group(1).strip() if resp_match else llm_text
 
-        # (F) Save to DB (ChatExchange)
+        # (F) Save to DB
         new_ex = ChatExchange(
             user_message=user_prompt,
             llm_response=final_response,
@@ -128,7 +131,6 @@ async def image_recognize_endpoint(
             "response": final_response,
             "exchange_id": new_ex.id
         }
-
     finally:
         db.close()
 
@@ -143,15 +145,14 @@ async def chat_endpoint(
 ):
     """
     If user only sends text => short-term memory approach.
-    We'll fetch last N from DB, passing any 'image_description'
-    from previous images as additional user text, so the LLM knows context.
+    We'll fetch last N from DB, passing any 'image_description' from previous images as context.
     """
     ROLLING_WINDOW_SIZE = 5
     db = SessionLocal()
     try:
         old_exs = db.query(ChatExchange) \
-            .order_by(ChatExchange.timestamp.desc()) \
-            .limit(ROLLING_WINDOW_SIZE).all()
+                    .order_by(ChatExchange.timestamp.desc()) \
+                    .limit(ROLLING_WINDOW_SIZE).all()
         old_exs.reverse()
 
         system_msg = {
@@ -164,7 +165,7 @@ async def chat_endpoint(
             user_txt = exch.user_message.strip() if exch.user_message else ""
             if exch.image_description and exch.image_description.strip():
                 user_txt += f"\n[Previous Image Description: {exch.image_description.strip()}]"
-            
+
             if user_txt.strip():
                 conversation.append({"role": "user", "content": user_txt})
 
@@ -174,7 +175,9 @@ async def chat_endpoint(
         # new user text
         conversation.append({"role": "user", "content": message.strip()})
 
+        from openai import OpenAI
         client = OpenAI(api_key=openai.api_key)
+
         try:
             resp = client.chat.completions.create(
                 model=model,
@@ -188,10 +191,7 @@ async def chat_endpoint(
             llm_msg = "(Error calling text model.)"
 
         # store
-        new_ex = ChatExchange(
-            user_message=message,
-            llm_response=llm_msg
-        )
+        new_ex = ChatExchange(user_message=message, llm_response=llm_msg)
         db.add(new_ex)
         db.commit()
         db.refresh(new_ex)
@@ -283,3 +283,17 @@ def search_docs_endpoint(
 ):
     results = query_docs(query, top_k=top_k)
     return {"results": results}
+
+
+# -------------------------------------------------------------
+# 6) /api/agent => The new Agent endpoint
+# -------------------------------------------------------------
+@app.post("/api/agent")
+def agent_endpoint(user_input: str = Body(..., embed=True)):
+    logger.info(f"Received user_input for agent: {user_input}")
+    final_answer, debug_info = run_agent(user_input)  # This now returns a tuple
+    logger.info(f"Final answer from agent: {final_answer}")
+    return {
+        "final_answer": final_answer,
+        "debug_info": debug_info
+    }
