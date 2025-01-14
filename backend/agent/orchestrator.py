@@ -201,11 +201,34 @@ def build_system_prompt_for_block(block_name: str, block_description: str, task_
             f"task_memory => {json.dumps(task_memory, default=str)}"
         )
 
-    elif block_name == "sql_block":
+    elif block_name == "sql_block":           # Here’s a more complete schema block to help the LLM:
+        db_schema_str = (
+            "Here is your DB schema:\n"
+            "- fridge_items:\n"
+            "   columns => [id, name, quantity, unit, expiration_date, category]\n"
+            "   ALWAYS_ALLOW for writes.\n"
+            "- shopping_items:\n"
+            "   columns => [id, name, desired_quantity, unit, purchased]\n"
+            "   ALWAYS_ALLOW for writes.\n"
+            "- invoices:\n"
+            "   columns => [id, date, total_amount, store_name]\n"
+            "   REQUIRE_USER for writes.\n"
+            "- invoice_items:\n"
+            "   columns => [id, invoice_id, name, quantity, price_per_unit]\n"
+            "   REQUIRE_USER for writes.\n"
+            "- monthly_spendings:\n"
+            "   columns => [id, year_month, total_spent]\n"
+            "   ALWAYS_DENY for writes.\n"
+            "\n"
+            # If you have more tables or disclaimers, add them here
+        )
         return (
             "You are 'sql_block'. You produce { table_name, columns, values, action_type, explanation }.\n"
-            "Make sure to use existing columns for fridge_items => [id,name,quantity,unit,expiration_date,category].\n"
             "If you do an INSERT, please supply all needed columns. If user didn't specify, use 'misc' or default.\n"
+            "Use EXACT existing table names from the schema below. If you do an INSERT, supply all needed columns.\n"
+            + db_schema_str
+            + "\n"  # separate line
+            + "Example: If user says 'What's on my shopping list?', you select from 'shopping_items'.\n"
             "No disclaimers. You MUST produce a function call object exactly like:\n"
             "{\n"
             '  "name": "sql_block",\n'
