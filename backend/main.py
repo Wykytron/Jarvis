@@ -1,4 +1,5 @@
 # main.py
+
 from fastapi import FastAPI, UploadFile, File, Form, Body
 import os
 import base64
@@ -14,10 +15,7 @@ from parser_utils import parse_file
 # Import the orchestrator "run_agent"
 from agent.orchestrator import run_agent
 
-# We no longer call old openai.* directly. We'll create a client in your orchestrator.
-# So we don't do import openai here except for referencing openai.api_key if needed:
 import openai
-
 import logging
 
 load_dotenv()
@@ -25,16 +23,19 @@ openai.api_key = os.getenv("OPENAI_API_KEY")
 
 app = FastAPI()
 
+###############################################################################
+# LOGGING SETUP
+###############################################################################
 logging.basicConfig(
-    level=logging.INFO,            # or DEBUG
+    level=logging.INFO,  # or DEBUG if needed
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 )
-
 logger = logging.getLogger("agent")
 
-# -------------------------------------------------------------
+
+###############################################################################
 # 1) /api/image_recognize
-# -------------------------------------------------------------
+###############################################################################
 @app.post("/api/image_recognize")
 async def image_recognize_endpoint(
     file: UploadFile = File(...),
@@ -42,10 +43,10 @@ async def image_recognize_endpoint(
     model: str = Form("gpt-4o-mini")
 ):
     """
-    1) We pass content_parts to the model so it can 'see' the image.
-    2) We also add a system instruction requiring <Title>, <Description>, <Response>.
-    3) The model returns them, which we parse & store in DB.
-    4) We always return them for the frontend display.
+    Example route for image recognition. 
+    1) Convert image to base64
+    2) Possibly pass to an image-based model
+    3) Store results
     """
     db = SessionLocal()
     try:
@@ -53,7 +54,7 @@ async def image_recognize_endpoint(
         raw_img = await file.read()
         user_image_b64 = base64.b64encode(raw_img).decode("utf-8")
 
-        # (B) Build content parts
+        # (B) Build content parts (prompt + image)
         content_parts = []
         if user_prompt.strip():
             content_parts.append({"type": "text", "text": user_prompt.strip()})
@@ -62,16 +63,15 @@ async def image_recognize_endpoint(
             "image_url": {"url": f"data:image/jpeg;base64,{user_image_b64}"}
         })
 
-        # (C) The instructions
+        # (C) The instructions for the image model
         instructions = (
             "You are an expert image recognition AI. The user may provide a prompt + image. "
-            "If no additional prompt is provided, put something like 'How can i help you with this image?' "
+            "If no additional prompt is provided, put something like 'How can I help you with this image?' "
             "into the <Response> section.\n"
             "Return EXACT:\n<Title>...</Title>\n<Description>...</Description>\n<Response>...</Response>\n"
         )
 
-        # (D) Use the new interface. We'll create a client from openai directly.
-        # We can do a "from openai import OpenAI" pattern, or we can do minimal code here:
+        # (D) Call the model
         from openai import OpenAI
         client = OpenAI(api_key=openai.api_key)
 
@@ -87,7 +87,7 @@ async def image_recognize_endpoint(
             )
             llm_text = resp.choices[0].message.content or ""
         except Exception as e:
-            print("Error calling the image model:", e)
+            logger.error("Error calling the image model: %s", e)
             return {"error": f"Model call failed: {str(e)}"}
 
         # (E) Parse <Title>, <Description>, <Response>
@@ -111,7 +111,7 @@ async def image_recognize_endpoint(
         db.commit()
         db.refresh(new_ex)
 
-        # (G) Also store + embed the image_desc as doc
+        # (G) Also store + embed the image_desc in documents
         new_doc = Document(
             filename=f"image_{new_ex.id}.jpg",
             file_content=raw_img,
@@ -122,6 +122,7 @@ async def image_recognize_endpoint(
         db.commit()
         db.refresh(new_doc)
 
+        # optional: vector-store indexing
         if image_desc.strip():
             ingest_document(new_doc.id, image_desc)
 
@@ -135,9 +136,9 @@ async def image_recognize_endpoint(
         db.close()
 
 
-# -------------------------------------------------------------
-# 2) /api/chat => text-only short-term memory
-# -------------------------------------------------------------
+###############################################################################
+# 2) /api/chat => text-based short-term memory
+###############################################################################
 @app.post("/api/chat")
 async def chat_endpoint(
     message: str = Form(...),
@@ -145,7 +146,8 @@ async def chat_endpoint(
 ):
     """
     If user only sends text => short-term memory approach.
-    We'll fetch last N from DB, passing any 'image_description' from previous images as context.
+    We'll fetch last N messages from DB, passing any 'image_description' as context.
+    The model can see ~5 prior user/assistant messages.
     """
     ROLLING_WINDOW_SIZE = 5
     db = SessionLocal()
@@ -172,7 +174,7 @@ async def chat_endpoint(
             if exch.llm_response and exch.llm_response.strip():
                 conversation.append({"role": "assistant", "content": exch.llm_response.strip()})
 
-        # new user text
+        # add the new user text
         conversation.append({"role": "user", "content": message.strip()})
 
         from openai import OpenAI
@@ -187,10 +189,10 @@ async def chat_endpoint(
             )
             llm_msg = resp.choices[0].message.content
         except Exception as e:
-            print("Error calling text model:", e)
+            logger.error("Error calling text model: %s", e)
             llm_msg = "(Error calling text model.)"
 
-        # store
+        # store the conversation
         new_ex = ChatExchange(user_message=message, llm_response=llm_msg)
         db.add(new_ex)
         db.commit()
@@ -201,11 +203,14 @@ async def chat_endpoint(
         db.close()
 
 
-# -------------------------------------------------------------
+###############################################################################
 # 3) /api/history => returns text + optional image
-# -------------------------------------------------------------
+###############################################################################
 @app.get("/api/history")
 def get_chat_history():
+    """
+    Simple route to return all ChatExchange rows in ascending timestamp order.
+    """
     db = SessionLocal()
     try:
         rows = db.query(ChatExchange).order_by(ChatExchange.timestamp.asc()).all()
@@ -229,21 +234,25 @@ def get_chat_history():
         db.close()
 
 
-# -------------------------------------------------------------
+###############################################################################
 # 4) /api/ingest => doc ingestion
-# -------------------------------------------------------------
+###############################################################################
 @app.post("/api/ingest")
 async def ingest_endpoint(
     file: UploadFile = File(...),
     description: str = Form(None)
 ):
+    """
+    Example route for ingesting a file, extracting text, storing in DB, then
+    indexing into a vector store for semantic search.
+    """
     raw_bytes = await file.read()
     filename = file.filename or f"unknown-{uuid.uuid4()}"
-    extension = filename.rsplit(".",1)[-1].lower()
+    extension = filename.rsplit(".", 1)[-1].lower()
     text_content = parse_file(raw_bytes, extension)
 
     if not description or not description.strip():
-        base_name = filename.rsplit(".",1)[0]
+        base_name = filename.rsplit(".", 1)[0]
         description = base_name
 
     db = SessionLocal()
@@ -273,26 +282,35 @@ async def ingest_endpoint(
         db.close()
 
 
-# -------------------------------------------------------------
+###############################################################################
 # 5) /api/search_docs => vector search
-# -------------------------------------------------------------
+###############################################################################
 @app.post("/api/search_docs")
 def search_docs_endpoint(
     query: str = Body(..., embed=True),
     top_k: int = Body(3, embed=True)
 ):
+    """
+    Return the top_k similar documents from the vector store.
+    """
     results = query_docs(query, top_k=top_k)
     return {"results": results}
 
 
-# -------------------------------------------------------------
+###############################################################################
 # 6) /api/agent => The new Agent endpoint
-# -------------------------------------------------------------
+###############################################################################
 @app.post("/api/agent")
-def agent_endpoint(user_input: str = Body(..., embed=True)):
+def agent_endpoint(user_input: str = Body(..., embed=True), chosen_model: str = Body("gpt-3.5-turbo", embed=True)):
     logger.info(f"Received user_input for agent: {user_input}")
-    final_answer, debug_info = run_agent(user_input)  # This now returns a tuple
+    # If the frontend sends a model name in the same payload, store it in memory so orchestrator can use it
+    task_memory = {}
+    if chosen_model and chosen_model.strip():
+        task_memory["agent_model"] = chosen_model.strip()
+
+    final_answer, debug_info = run_agent(user_input, task_memory)
     logger.info(f"Final answer from agent: {final_answer}")
+
     return {
         "final_answer": final_answer,
         "debug_info": debug_info

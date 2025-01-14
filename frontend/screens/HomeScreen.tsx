@@ -492,7 +492,8 @@ function HomeScreen({ navigation }: any) {
     addTask('Agent Request');
     try {
       const resp = await axios.post(`${BACKEND_URL}/api/agent`, {
-        user_input: textMessage.trim()
+        user_input: textMessage.trim(),
+        chosen_model: textModel,
       });
       removeTask('Agent Request');
 

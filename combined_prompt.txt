@@ -1,0 +1,1105 @@
+=== SYSTEM PROMPT ===
+You are ChatGPT, a helpful developer assistant. You have been provided with a subset of files from the Jarvis project. Use this context for answering any user questions about the code. Do not reveal sensitive information or partial content that was not provided.
+
+=== FOLDER STRUCTURE (SELECTED) ===
+v0.2/
+    backend/
+        database.py
+        main.py
+        agent/
+            blocks.py
+            orchestrator.py
+            schemas.py
+
+=== FILE CONTENTS ===
+
+--- database.py ---
+# database.py
+
+from sqlalchemy import (
+    create_engine, Column, Integer, Text, DateTime, String,
+    LargeBinary, Float, Boolean, Date, ForeignKey
+)
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker, relationship
+from datetime import datetime
+
+###############################################################################
+# SQLAlchemy Setup
+###############################################################################
+Base = declarative_base()
+engine = create_engine("sqlite:///chat_history.db", echo=False)
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+
+###############################################################################
+# ChatExchange & Document Tables
+###############################################################################
+class ChatExchange(Base):
+    """
+    Stores user <-> LLM interactions. Also supports storing images
+    if user sent an image + prompt. The table includes:
+      - user_message: The original text from the user
+      - llm_response: The LLM’s final text
+      - user_image_b64: If an image was provided, store its base64
+      - image_title / image_description: If the LLM provided structured info
+    """
+    __tablename__ = "chat_exchanges"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_message = Column(Text, nullable=True)
+    llm_response = Column(Text, nullable=True)
+    timestamp = Column(DateTime, default=datetime.utcnow)
+
+    # If user sent an image:
+    user_image_b64 = Column(Text, nullable=True)
+    image_title = Column(Text, nullable=True)
+    image_description = Column(Text, nullable=True)
+
+
+class Document(Base):
+    """
+    Example table for storing uploaded documents (like PDFs, images)
+    as binary data plus extracted text content. Could also be used
+    by the parse_block if we want the LLM to parse text in them.
+    """
+    __tablename__ = "documents"
+
+    id = Column(Integer, primary_key=True, index=True)
+    filename = Column(String)
+    file_content = Column(LargeBinary)
+    upload_time = Column(DateTime, default=datetime.utcnow)
+    text_content = Column(Text, nullable=True)
+    description = Column(Text, nullable=True)
+
+###############################################################################
+# Domain-Specific Tables (Fridge Items, Shopping List, Invoices, etc.)
+###############################################################################
+class FridgeItem(Base):
+    """
+    The 'fridge_items' table. Here is where we store items that
+    the user has physically in their fridge. For example:
+      - name='Milk', quantity=1.0, unit='liter', expiration_date=YYYY-MM-DD, category='dairy'
+    The LLM will do an INSERT/UPDATE with 'sql_block' if the user requests to add or modify items.
+    """
+    __tablename__ = "fridge_items"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, nullable=False)
+    quantity = Column(Float, default=1.0)
+    unit = Column(String, default="unit")
+    expiration_date = Column(Date, nullable=True)
+    category = Column(String, nullable=True)
+
+
+class ShoppingItem(Base):
+    """
+    The 'shopping_items' table for items on a shopping list.
+    For example:
+      - name='Tomatoes', desired_quantity=5, unit='units', purchased=False
+    """
+    __tablename__ = "shopping_items"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, nullable=False)
+    desired_quantity = Column(Float, default=1.0)
+    unit = Column(String, default="unit")
+    purchased = Column(Boolean, default=False)
+
+
+class Invoice(Base):
+    """
+    The 'invoices' table: one row per invoice/receipt. This table is
+    'REQUIRE_USER' in table_permissions, meaning user must confirm writes
+    (in your baby-step scenario we assume user_permission=True).
+    Potential usage: 
+      - parse_block => parse invoice text => produce structured line items
+      - sql_block => do INSERT INTO invoices(...) plus invoice_items(...)
+    """
+    __tablename__ = "invoices"
+
+    id = Column(Integer, primary_key=True, index=True)
+    date = Column(Date, nullable=False)  # e.g. date of purchase
+    total_amount = Column(Float, default=0.0)
+    store_name = Column(String, nullable=True)
+
+    # Relationship: invoice has many invoice_items
+    items = relationship("InvoiceItem", back_populates="invoice")
+
+
+class InvoiceItem(Base):
+    """
+    The line items for a given invoice, e.g. 
+      - name='Chicken Breast', quantity=2.0, price_per_unit=5.0, invoice_id=?
+    """
+    __tablename__ = "invoice_items"
+
+    id = Column(Integer, primary_key=True, index=True)
+    invoice_id = Column(Integer, ForeignKey("invoices.id"))
+    name = Column(String, nullable=False)
+    quantity = Column(Float, default=1.0)
+    price_per_unit = Column(Float, default=0.0)
+
+    invoice = relationship("Invoice", back_populates="items")
+
+
+class MonthlySpending(Base):
+    """
+    Example table for monthly spend tracking. 
+    Another 'ALWAYS_DENY' for writes in baby step, so agent
+    cannot do INSERT/UPDATE/DELETE on monthly_spendings.
+    """
+    __tablename__ = "monthly_spendings"
+
+    id = Column(Integer, primary_key=True, index=True)
+    year_month = Column(String, nullable=False)  # e.g. "2025-01"
+    total_spent = Column(Float, default=0.0)
+
+###############################################################################
+# Create all tables once
+###############################################################################
+Base.metadata.create_all(bind=engine)
+
+###############################################################################
+# Table Permissions
+###############################################################################
+# We define which tables are ALWAYS_ALLOW, REQUIRE_USER, or ALWAYS_DENY for writes.
+# This is used by the 'sql_block' to decide if an INSERT/UPDATE/DELETE is permitted.
+table_permissions = {
+    "chat_exchanges":    "ALWAYS_DENY",   # never allow writes from the LLM
+    "documents":         "ALWAYS_DENY",   # same reason
+    "fridge_items":      "ALWAYS_ALLOW",  # can always INSERT/UPDATE
+    "shopping_items":    "ALWAYS_ALLOW",  # can always INSERT/UPDATE
+    "invoices":          "REQUIRE_USER",  # user_permission=True for now
+    "invoice_items":     "REQUIRE_USER",  # user_permission=True for now
+    "monthly_spendings": "ALWAYS_DENY"    # denies writes
+}
+
+--- main.py ---
+# main.py
+
+from fastapi import FastAPI, UploadFile, File, Form, Body
+import os
+import base64
+import uuid
+import re
+from dotenv import load_dotenv
+from datetime import datetime
+
+from database import SessionLocal, ChatExchange, Document
+from vectorstore import ingest_document, query_docs
+from parser_utils import parse_file
+
+# Import the orchestrator "run_agent"
+from agent.orchestrator import run_agent
+
+import openai
+import logging
+
+load_dotenv()
+openai.api_key = os.getenv("OPENAI_API_KEY")
+
+app = FastAPI()
+
+###############################################################################
+# LOGGING SETUP
+###############################################################################
+logging.basicConfig(
+    level=logging.INFO,  # or DEBUG if needed
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
+logger = logging.getLogger("agent")
+
+
+###############################################################################
+# 1) /api/image_recognize
+###############################################################################
+@app.post("/api/image_recognize")
+async def image_recognize_endpoint(
+    file: UploadFile = File(...),
+    user_prompt: str = Form(""),
+    model: str = Form("gpt-4o-mini")
+):
+    """
+    Example route for image recognition. 
+    1) Convert image to base64
+    2) Possibly pass to an image-based model
+    3) Store results
+    """
+    db = SessionLocal()
+    try:
+        # (A) Base64-encode the image
+        raw_img = await file.read()
+        user_image_b64 = base64.b64encode(raw_img).decode("utf-8")
+
+        # (B) Build content parts (prompt + image)
+        content_parts = []
+        if user_prompt.strip():
+            content_parts.append({"type": "text", "text": user_prompt.strip()})
+        content_parts.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:image/jpeg;base64,{user_image_b64}"}
+        })
+
+        # (C) The instructions for the image model
+        instructions = (
+            "You are an expert image recognition AI. The user may provide a prompt + image. "
+            "If no additional prompt is provided, put something like 'How can I help you with this image?' "
+            "into the <Response> section.\n"
+            "Return EXACT:\n<Title>...</Title>\n<Description>...</Description>\n<Response>...</Response>\n"
+        )
+
+        # (D) Call the model
+        from openai import OpenAI
+        client = OpenAI(api_key=openai.api_key)
+
+        try:
+            resp = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": instructions},
+                    {"role": "user", "content": content_parts},
+                ],
+                max_tokens=400,
+                temperature=0.7
+            )
+            llm_text = resp.choices[0].message.content or ""
+        except Exception as e:
+            logger.error("Error calling the image model: %s", e)
+            return {"error": f"Model call failed: {str(e)}"}
+
+        # (E) Parse <Title>, <Description>, <Response>
+        title_match = re.search(r"<Title>(.*?)</Title>", llm_text, re.DOTALL)
+        desc_match = re.search(r"<Description>(.*?)</Description>", llm_text, re.DOTALL)
+        resp_match = re.search(r"<Response>(.*?)</Response>", llm_text, re.DOTALL)
+
+        image_title = title_match.group(1).strip() if title_match else ""
+        image_desc = desc_match.group(1).strip() if desc_match else ""
+        final_response = resp_match.group(1).strip() if resp_match else llm_text
+
+        # (F) Save to DB
+        new_ex = ChatExchange(
+            user_message=user_prompt,
+            llm_response=final_response,
+            user_image_b64=user_image_b64,
+            image_title=image_title,
+            image_description=image_desc
+        )
+        db.add(new_ex)
+        db.commit()
+        db.refresh(new_ex)
+
+        # (G) Also store + embed the image_desc in documents
+        new_doc = Document(
+            filename=f"image_{new_ex.id}.jpg",
+            file_content=raw_img,
+            text_content=image_desc,
+            description=image_title
+        )
+        db.add(new_doc)
+        db.commit()
+        db.refresh(new_doc)
+
+        # optional: vector-store indexing
+        if image_desc.strip():
+            ingest_document(new_doc.id, image_desc)
+
+        return {
+            "title": image_title,
+            "description": image_desc,
+            "response": final_response,
+            "exchange_id": new_ex.id
+        }
+    finally:
+        db.close()
+
+
+###############################################################################
+# 2) /api/chat => text-based short-term memory
+###############################################################################
+@app.post("/api/chat")
+async def chat_endpoint(
+    message: str = Form(...),
+    model: str = Form("gpt-3.5-turbo")
+):
+    """
+    If user only sends text => short-term memory approach.
+    We'll fetch last N messages from DB, passing any 'image_description' as context.
+    The model can see ~5 prior user/assistant messages.
+    """
+    ROLLING_WINDOW_SIZE = 5
+    db = SessionLocal()
+    try:
+        old_exs = db.query(ChatExchange) \
+                    .order_by(ChatExchange.timestamp.desc()) \
+                    .limit(ROLLING_WINDOW_SIZE).all()
+        old_exs.reverse()
+
+        system_msg = {
+            "role": "system",
+            "content": "You are a helpful text-based assistant. You recall the last few messages."
+        }
+        conversation = [system_msg]
+
+        for exch in old_exs:
+            user_txt = exch.user_message.strip() if exch.user_message else ""
+            if exch.image_description and exch.image_description.strip():
+                user_txt += f"\n[Previous Image Description: {exch.image_description.strip()}]"
+
+            if user_txt.strip():
+                conversation.append({"role": "user", "content": user_txt})
+
+            if exch.llm_response and exch.llm_response.strip():
+                conversation.append({"role": "assistant", "content": exch.llm_response.strip()})
+
+        # add the new user text
+        conversation.append({"role": "user", "content": message.strip()})
+
+        from openai import OpenAI
+        client = OpenAI(api_key=openai.api_key)
+
+        try:
+            resp = client.chat.completions.create(
+                model=model,
+                messages=conversation,
+                max_tokens=400,
+                temperature=0.7
+            )
+            llm_msg = resp.choices[0].message.content
+        except Exception as e:
+            logger.error("Error calling text model: %s", e)
+            llm_msg = "(Error calling text model.)"
+
+        # store the conversation
+        new_ex = ChatExchange(user_message=message, llm_response=llm_msg)
+        db.add(new_ex)
+        db.commit()
+        db.refresh(new_ex)
+
+        return {"response": llm_msg}
+    finally:
+        db.close()
+
+
+###############################################################################
+# 3) /api/history => returns text + optional image
+###############################################################################
+@app.get("/api/history")
+def get_chat_history():
+    """
+    Simple route to return all ChatExchange rows in ascending timestamp order.
+    """
+    db = SessionLocal()
+    try:
+        rows = db.query(ChatExchange).order_by(ChatExchange.timestamp.asc()).all()
+        hist = []
+        for r in rows:
+            item = {
+                "id": r.id,
+                "timestamp": r.timestamp.isoformat(),
+                "user_message": r.user_message or "",
+                "llm_response": r.llm_response or ""
+            }
+            if r.user_image_b64:
+                item["user_image_b64"] = r.user_image_b64
+            if r.image_title:
+                item["image_title"] = r.image_title
+            if r.image_description:
+                item["image_description"] = r.image_description
+            hist.append(item)
+        return {"history": hist}
+    finally:
+        db.close()
+
+
+###############################################################################
+# 4) /api/ingest => doc ingestion
+###############################################################################
+@app.post("/api/ingest")
+async def ingest_endpoint(
+    file: UploadFile = File(...),
+    description: str = Form(None)
+):
+    """
+    Example route for ingesting a file, extracting text, storing in DB, then
+    indexing into a vector store for semantic search.
+    """
+    raw_bytes = await file.read()
+    filename = file.filename or f"unknown-{uuid.uuid4()}"
+    extension = filename.rsplit(".", 1)[-1].lower()
+    text_content = parse_file(raw_bytes, extension)
+
+    if not description or not description.strip():
+        base_name = filename.rsplit(".", 1)[0]
+        description = base_name
+
+    db = SessionLocal()
+    try:
+        new_doc = Document(
+            filename=filename,
+            file_content=raw_bytes,
+            text_content=text_content,
+            description=description
+        )
+        db.add(new_doc)
+        db.commit()
+        db.refresh(new_doc)
+
+        doc_id = new_doc.id
+        if text_content.strip():
+            ingest_document(doc_id, text_content)
+
+        return {
+            "status": "ok",
+            "doc_id": doc_id,
+            "filename": filename,
+            "description": description,
+            "text_length": len(text_content)
+        }
+    finally:
+        db.close()
+
+
+###############################################################################
+# 5) /api/search_docs => vector search
+###############################################################################
+@app.post("/api/search_docs")
+def search_docs_endpoint(
+    query: str = Body(..., embed=True),
+    top_k: int = Body(3, embed=True)
+):
+    """
+    Return the top_k similar documents from the vector store.
+    """
+    results = query_docs(query, top_k=top_k)
+    return {"results": results}
+
+
+###############################################################################
+# 6) /api/agent => The new Agent endpoint
+###############################################################################
+@app.post("/api/agent")
+def agent_endpoint(user_input: str = Body(..., embed=True)):
+    """
+    Main user-facing route for conversation + DB tasks via run_agent().
+    The agent may decide to use parse_block -> parse user input into structured data,
+    sql_block -> run queries (Method A), or output_block -> finalize the answer.
+    """
+    logger.info(f"Received user_input for agent: {user_input}")
+
+    final_answer, debug_info = run_agent(user_input)
+    logger.info(f"Final answer from agent: {final_answer}")
+
+    return {
+        "final_answer": final_answer,
+        "debug_info": debug_info
+    }
+
+--- blocks.py ---
+# blocks.py
+
+import json
+import logging
+from typing import Any, Dict
+
+from database import SessionLocal, table_permissions
+from sqlalchemy import text
+
+logger = logging.getLogger("agent")
+
+def handle_parse_block(args: Dict[str, Any], task_memory: dict, debug_info: list) -> dict:
+    raw_text = args.get("raw_text", "")
+    explanation = args.get("explanation", "")
+    parsed_item = args.get("parsed_item", {})
+
+    debug_info.append(f"[parse_block] raw_text={raw_text}, explanation={explanation}")
+
+    task_memory["parsed_item"] = parsed_item
+    return {
+        "success": True,
+        "parsed_item": parsed_item,
+        "explanation": explanation
+    }
+
+def handle_sql_block(args: Dict[str, Any], task_memory: dict, debug_info: list) -> dict:
+    table_name = args.get("table_name", "").strip()
+    columns = args.get("columns", [])
+    values = args.get("values", [])
+    action_type = args.get("action_type", "").upper()
+    explanation = args.get("explanation", "")
+
+    debug_info.append(f"[sql_block] user gave => table={table_name}, cols={columns}, vals={values}, action={action_type}")
+    debug_info.append(f"[sql_block] explanation={explanation}")
+
+    if table_name == "fridge_items":
+        columns, values = fix_fridge_columns_and_values(columns, values, debug_info)
+
+    # auto-quote
+    quoted_vals = []
+    for v in values:
+        v_str = str(v).strip()
+        if v_str.startswith("'") and v_str.endswith("'"):
+            quoted_vals.append(v_str)
+        elif v_str.replace(".", "", 1).isdigit():
+            quoted_vals.append(v_str)
+        else:
+            quoted_vals.append(f"'{v_str}'")
+    values = quoted_vals
+
+    if not table_name:
+        msg = "[sql_block] No table_name provided"
+        debug_info.append(msg)
+        return {"error": msg}
+
+    permission_mode = table_permissions.get(table_name, "ALWAYS_DENY")
+    user_permission = True
+
+    if action_type == "SELECT":
+        if permission_mode == "ALWAYS_DENY":
+            msg = f"[sql_block] SELECT on '{table_name}' => ALWAYS_DENY"
+            debug_info.append(msg)
+            logger.warning(msg)
+            return {"error": msg}
+        col_list_str = "*"
+        if columns:
+            col_list_str = ", ".join(columns)
+        sql_query = f"SELECT {col_list_str} FROM {table_name};"
+        return run_select_query(sql_query, explanation, debug_info, task_memory)
+
+    elif action_type in ["INSERT", "UPDATE", "DELETE"]:
+        if permission_mode == "ALWAYS_DENY":
+            msg = f"[sql_block] Writes to '{table_name}' => ALWAYS_DENY"
+            debug_info.append(msg)
+            logger.warning(msg)
+            return {"error": msg}
+        if permission_mode == "REQUIRE_USER" and not user_permission:
+            msg = f"[sql_block] Write to '{table_name}' => require user permission not granted"
+            debug_info.append(msg)
+            logger.warning(msg)
+            return {"error": msg}
+
+        if action_type == "INSERT":
+            if len(columns) != len(values):
+                msg = f"[sql_block] Mismatch col vs. val => {columns} vs. {values}"
+                debug_info.append(msg)
+                logger.warning(msg)
+                return {"error": msg}
+
+            col_list_str = ", ".join(columns)
+            val_list_str = ", ".join(values)
+            sql_query = f"INSERT INTO {table_name}({col_list_str}) VALUES({val_list_str});"
+            debug_info.append(f"[sql_block] final insert => {sql_query}")
+            return run_write_query(sql_query, explanation, debug_info)
+
+        elif action_type == "UPDATE":
+            return {"error":"UPDATE not implemented yet"}
+
+        elif action_type == "DELETE":
+            return {"error":"DELETE not implemented yet"}
+
+    else:
+        msg = f"[sql_block] unknown action_type={action_type}"
+        debug_info.append(msg)
+        logger.warning(msg)
+        return {"error": msg}
+
+def fix_fridge_columns_and_values(cols, vals, debug_info):
+    required = ["name","quantity","unit","expiration_date","category"]
+    new_cols = []
+    for c in cols:
+        c_lower = c.lower().strip()
+        if c_lower in ("item_name","food_name"):
+            new_cols.append("name")
+        else:
+            new_cols.append(c.strip())
+
+    col_val_map = {}
+    for c, v in zip(new_cols, vals):
+        col_val_map[c.lower()] = v
+
+    final_cols = []
+    final_vals = []
+    for r in required:
+        if r in col_val_map:
+            final_cols.append(r)
+            final_vals.append(col_val_map[r])
+        else:
+            final_cols.append(r)
+            if r == "quantity":
+                final_vals.append("1")
+            elif r == "unit":
+                final_vals.append("'unit'")
+            elif r == "expiration_date":
+                final_vals.append("'2025-12-31'")
+            elif r == "category":
+                final_vals.append("'misc'")
+            else:
+                final_vals.append("'unknown'")
+
+    debug_info.append(f"[fix_fridge] final cols={final_cols}, vals={final_vals}")
+    return (final_cols, final_vals)
+
+def run_select_query(sql_query: str, explanation: str, debug_info: list, task_memory: dict) -> dict:
+    db = SessionLocal()
+    rows_data = []
+    error_msg = None
+    try:
+        debug_info.append(f"[sql_block] Running SELECT => {sql_query}")
+        logger.info(f"[sql_block] Running SELECT => {sql_query}")
+        result = db.execute(text(sql_query))
+        all_rows = result.fetchall()
+        for r in all_rows:
+            row_dict = dict(r._mapping)
+            rows_data.append(row_dict)
+        debug_info.append(f"[sql_block] SELECT => got {len(rows_data)} rows")
+        logger.info(f"[sql_block] success => SELECT '{sql_query}', rows={len(rows_data)}")
+    except Exception as e:
+        error_msg = str(e)
+        debug_info.append(f"[sql_block] error => {error_msg}")
+        logger.warning(f"[sql_block] SELECT error => {error_msg}")
+    finally:
+        db.close()
+    if error_msg:
+        return {"error": error_msg, "sql_query": sql_query}
+    task_memory["last_sql_rows"] = rows_data
+    return {
+        "success": True,
+        "rows_data": rows_data,
+        "explanation": explanation,
+        "rows_count": len(rows_data)
+    }
+
+def run_write_query(sql_query: str, explanation: str, debug_info: list) -> dict:
+    db = SessionLocal()
+    error_msg = None
+    rowcount = 0
+    try:
+        debug_info.append(f"[sql_block] Running WRITE => {sql_query}")
+        logger.info(f"[sql_block] Running WRITE => {sql_query}")
+        result = db.execute(text(sql_query))
+        rowcount = result.rowcount if result.rowcount else 0
+        db.commit()
+        debug_info.append(f"[sql_block] WRITE => rowcount={rowcount}")
+        logger.info(f"[sql_block] success => WRITE '{sql_query}', rowcount={rowcount}")
+    except Exception as e:
+        error_msg = str(e)
+        debug_info.append(f"[sql_block] write error => {error_msg}")
+        logger.warning(f"[sql_block] WRITE error => {error_msg}")
+        db.rollback()
+    finally:
+        db.close()
+    if error_msg:
+        return {"error": error_msg, "sql_query": sql_query}
+    return {
+        "success": True,
+        "rows_affected": rowcount,
+        "explanation": explanation
+    }
+
+def handle_output_block(args: Dict[str, Any], task_memory: dict, debug_info: list) -> dict:
+    final_message = args.get("final_message","").strip()
+    if not final_message:
+        final_message = "(No final_message in output_block)"
+
+    last_result = task_memory.get("last_sql_block_result", {})
+    # if SELECT success => we can override error disclaimers
+    if last_result.get("rows_data") and len(last_result["rows_data"])>0:
+        if last_result.get("error") is None:
+            if "error" in final_message.lower():
+                row_data = last_result["rows_data"]
+                final_message = "Here are your fridge items:\n"
+                for i,r in enumerate(row_data,1):
+                    final_message += f"{i}. {r}\n"
+
+    # if INSERT success => override negative disclaimers
+    if "rows_affected" in last_result and last_result["rows_affected"]>0:
+        if "error" in final_message.lower():
+            final_message = "Your item was successfully inserted into the fridge!"
+
+    debug_info.append(f"[output_block] final_message => {final_message}")
+    logger.info(f"[output_block] final_message => {final_message}")
+    return {"final_answer": final_message}
+
+--- orchestrator.py ---
+# orchestrator.py
+
+import json
+import os
+import logging
+
+from .schemas import ALL_FUNCTION_SCHEMAS, PlanTasksArguments
+from .blocks import handle_parse_block, handle_sql_block, handle_output_block
+
+import openai
+from openai import OpenAI
+
+logger = logging.getLogger("agent")
+
+def call_openai_plan(user_request: str, debug_info: list) -> PlanTasksArguments:
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    plan_path = os.path.join(base_dir, "prompts", "plan_prompt.md")
+    with open(plan_path, "r", encoding="utf-8") as f:
+        plan_instructions = f.read()
+
+    messages = [
+        {"role": "system", "content": plan_instructions},
+        {"role": "user", "content": f"USER REQUEST: {user_request}"}
+    ]
+
+    logger.info(f"[call_openai_plan] user_request='{user_request}'")
+    debug_info.append(f"[plan] user_request='{user_request}'")
+
+    client = OpenAI(api_key=openai.api_key)
+    resp = client.chat.completions.create(
+        model="gpt-4-0613",
+        messages=messages,
+        functions=[fn for fn in ALL_FUNCTION_SCHEMAS if fn["name"] == "plan_tasks"],
+        function_call="auto",
+        temperature=0.7
+    )
+    logger.info(f"[call_openai_plan] raw response => {resp}")
+    debug_info.append(f"[plan] raw response => {resp}")
+
+    choice = resp.choices[0]
+    fn_call = choice.message.function_call
+
+    if fn_call:
+        fn_args_str = fn_call.arguments
+        debug_info.append(f"[plan] function_call arguments => {fn_args_str}")
+        logger.info(f"[call_openai_plan] function_call name={fn_call.name}, arguments={fn_call.arguments}")
+        try:
+            data = json.loads(fn_args_str)
+            plan_args = PlanTasksArguments(**data)
+            return plan_args
+        except Exception as e:
+            debug_info.append(f"[plan] parse error => {e}")
+            logger.warning(f"[call_openai_plan] parse error => {e}")
+            return PlanTasksArguments(tasks=[])
+    else:
+        # fallback parse from content
+        content_str = choice.message.content or ""
+        debug_info.append(f"[plan] no function_call, content => {content_str}")
+        try:
+            candidate = json.loads(content_str)
+            if "name" in candidate and "arguments" in candidate:
+                plan_args_data = candidate["arguments"]
+                return PlanTasksArguments(**plan_args_data)
+        except:
+            pass
+        logger.info("[call_openai_plan] no tasks returned")
+        return PlanTasksArguments(tasks=[])
+
+def call_block_llm(block_name: str, block_description: str, task_memory: dict, debug_info: list):
+    logger.info(f"[call_block_llm] block={block_name}, desc={block_description}")
+    debug_info.append(f"[block_llm] block={block_name}, desc={block_description}")
+
+    from .schemas import ALL_FUNCTION_SCHEMAS
+    block_schema = None
+    for s in ALL_FUNCTION_SCHEMAS:
+        if s["name"] == block_name:
+            block_schema = s
+            break
+    if not block_schema:
+        msg = f"No schema found for block={block_name}"
+        debug_info.append(msg)
+        logger.warning(msg)
+        return {"error": msg}
+
+    system_prompt = build_system_prompt_for_block(block_name, block_description, task_memory)
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": block_description}
+    ]
+
+    client = OpenAI(api_key=openai.api_key)
+    resp = client.chat.completions.create(
+        model="gpt-4-0613",
+        messages=messages,
+        functions=[block_schema],
+        function_call="auto",
+        temperature=0.7
+    )
+    logger.info(f"[call_block_llm] LLM resp => {resp}")
+    debug_info.append(f"[block_llm] raw response => {resp}")
+
+    choice = resp.choices[0]
+    fn_call = choice.message.function_call
+
+    ### 1) If GPT used actual function_call
+    if fn_call:
+        fn_args_str = fn_call.arguments
+        debug_info.append(f"[block_llm] function_call args => {fn_args_str}")
+        logger.info(f"[call_block_llm] function_call => name={fn_call.name}, args={fn_args_str}")
+
+        try:
+            args_data = json.loads(fn_args_str)
+        except Exception as e:
+            debug_info.append(f"[block_llm] JSON parse error => {e}")
+            logger.warning(f"[call_block_llm] JSON parse error => {e}")
+            return {"error": f"JSON parse error => {e}"}
+
+        return dispatch_block(block_name, args_data, task_memory, debug_info)
+
+    ### 2) If GPT used top-level JSON in .content instead
+    content_str = choice.message.content or ""
+    debug_info.append(f"[block_llm] no function_call, content => {content_str}")
+    logger.info(f"[block_llm] no function_call => fallback parse content")
+    try:
+        candidate = json.loads(content_str)
+        # e.g. { "name":"sql_block","arguments":{...} }
+        name_in_json = candidate.get("name","")
+        args_in_json = candidate.get("arguments",{})
+        if name_in_json == block_name:
+            debug_info.append(f"[block_llm] fallback => found block={name_in_json}")
+            logger.info(f"[call_block_llm] fallback parse => block={name_in_json}, arguments={args_in_json}")
+            return dispatch_block(block_name, args_in_json, task_memory, debug_info)
+        elif block_name == "output_block" and "final_message" in candidate:
+            # fallback for output
+            return {"final_answer": candidate["final_message"]}
+        else:
+            # not matching
+            msg = f"No function_call returned and fallback parse didn't match block={block_name}"
+            debug_info.append(msg)
+            logger.warning(msg)
+            return {"error": msg}
+    except Exception as e:
+        # no valid JSON
+        msg = f"No function_call returned, fallback parse error => {e}"
+        debug_info.append(msg)
+        logger.warning(msg)
+        return {"error": msg}
+
+def dispatch_block(block_name: str, args_data: dict, task_memory: dict, debug_info: list):
+    logger.info(f"[dispatch_block] block={block_name}, args={args_data}")
+    debug_info.append(f"[dispatch_block] block={block_name}, args={args_data}")
+
+    if block_name == "parse_block":
+        return handle_parse_block(args_data, task_memory, debug_info)
+    elif block_name == "sql_block":
+        return handle_sql_block(args_data, task_memory, debug_info)
+    elif block_name == "output_block":
+        return handle_output_block(args_data, task_memory, debug_info)
+    else:
+        msg = f"Unrecognized block => {block_name}"
+        debug_info.append(msg)
+        logger.warning(msg)
+        return {"error": msg}
+
+def build_system_prompt_for_block(block_name: str, block_description:str, task_memory: dict)->str:
+    if block_name=="parse_block":
+        user_req = task_memory.get("original_user_input","")
+        return (
+            "You are the 'parse_block'. You parse raw text into structured data { raw_text, parsed_item }.\n"
+            "No disclaimers. Return function_call => { name:'parse_block', arguments:{ raw_text:'...', explanation:'...', parsed_item:{...} }} if needed.\n"
+            f"user_input => {user_req}\n"
+            f"task_memory => {json.dumps(task_memory, default=str)}"
+        )
+    elif block_name=="sql_block":
+        return (
+            "You are 'sql_block'. You produce { table_name, columns, values, action_type, explanation }.\n"
+            "Make sure to use existing columns for fridge_items => [id,name,quantity,unit,expiration_date,category].\n"
+            "If you do an INSERT, please supply all needed columns. If user didn't specify, use 'misc' or default.\n"
+            "No disclaimers. You MUST produce a function call object EXACTLY like:\n"
+            "   {\n"
+            "     \"name\": \"sql_block\",\n"
+            "     \"arguments\": {\n"
+            "        \"table_name\": \"...\",\n"
+            "        \"columns\": [...],\n"
+            "        \"values\": [...],\n"
+            "        \"action_type\": \"...\",\n"
+            "        \"explanation\": \"...\"\n"
+            "     }\n"
+            "   }\n\n"
+            "Never produce code blocks or disclaimers.\n\n"
+            f"task_memory => {json.dumps(task_memory, default=str)}"
+        )
+    elif block_name=="output_block":
+        last_sql = task_memory.get("last_sql_block_result", {})
+        return (
+            "You are 'output_block'. Summarize final results. If there's data in last_sql_block_result, show it.\n"
+            "Output => { \"name\":\"output_block\", \"arguments\":{\"final_message\":\"...\"} }. No disclaimers.\n"
+            f"last_sql_block_result => {json.dumps(last_sql, default=str)}\n"
+            f"task_memory => {json.dumps(task_memory, default=str)}"
+        )
+    else:
+        return f"You are block {block_name}, partial memory => {json.dumps(task_memory, default=str)}"
+
+def run_agent(user_input: str):
+    debug_info = []
+    task_memory = {"original_user_input": user_input}
+
+    plan_result = call_openai_plan(user_input, debug_info)
+    if not plan_result.tasks:
+        return ("Could not plan tasks. Possibly clarify your request.", debug_info)
+
+    final_answer = "(No final answer produced)"
+
+    for step in plan_result.tasks:
+        block = step.block
+        desc = step.description
+        res = call_block_llm(block, desc, task_memory, debug_info)
+        task_memory[f"last_{block}_result"] = res
+
+        if block=="output_block":
+            if "final_answer" in res:
+                final_answer = res["final_answer"]
+            else:
+                fm = res.get("final_message","")
+                if fm:
+                    final_answer = fm
+            break
+
+    return (final_answer, debug_info)
+
+--- schemas.py ---
+# backend/agent/schemas.py
+
+from typing import List, Optional, Literal, Any
+from pydantic import BaseModel
+
+
+#
+# 1) plan_tasks
+#
+class PlanTaskItem(BaseModel):
+    block: str
+    description: str
+    title: str
+    reasoning: str = ""
+
+
+class PlanTasksArguments(BaseModel):
+    tasks: List[PlanTaskItem]
+
+
+plan_tasks_schema = {
+    "name": "plan_tasks",
+    "description": (
+        "Produce a short plan (a list of tasks) to solve the user request. "
+        "Each item has a block name, description, title, and reasoning."
+    ),
+    "parameters": PlanTasksArguments.schema()
+}
+
+
+#
+# 2) sql_block (Method A)
+#
+class SQLBlockArguments(BaseModel):
+    table_name: str
+    columns: List[str]    # e.g. ["name","quantity","unit","expiration_date","category"]
+    values: List[str]     # e.g. ["'Joghurt'","2","'unit'","'2025-01-25'","'dairy'"]
+    action_type: Literal["SELECT", "INSERT", "UPDATE", "DELETE"]
+    explanation: str = ""
+
+
+sql_block_schema = {
+    "name": "sql_block",
+    "description": (
+        "Use this to run a SQL query on the local DB. "
+        "No single big sql string—use 'table_name','columns','values','action_type','explanation'. "
+        "No disclaimers or code blocks—only valid JSON."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "table_name": {
+                "type": "string",
+                "description": "Target DB table, e.g. fridge_items or shopping_items"
+            },
+            "columns": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Which columns to read/write, e.g. ['name','quantity','unit','expiration_date','category']"
+            },
+            "values": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Matching values, e.g. ['Joghurt','2','Units','2025-01-25','Dairy']"
+            },
+            "action_type": {
+                "type": "string",
+                "enum": ["SELECT","INSERT","UPDATE","DELETE"]
+            },
+            "explanation": {
+                "type": "string",
+                "description": "Short explanation or reasoning behind the query"
+            }
+        },
+        "required": ["table_name","columns","values","action_type"],
+        "additionalProperties": False
+    }
+}
+
+
+#
+# 3) output_block
+#
+class OutputBlockArguments(BaseModel):
+    final_message: str
+
+
+output_block_schema = {
+    "name": "output_block",
+    "description": "Produces the final user-facing answer as JSON with 'final_message'.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "final_message": {
+                "type": "string",
+                "description": "User-facing text or summary"
+            }
+        },
+        "required": ["final_message"],
+        "additionalProperties": False
+    }
+}
+
+
+#
+# 4) parse_block
+#
+class ParseBlockArguments(BaseModel):
+    raw_text: str
+    explanation: Optional[str] = ""
+    parsed_item: Optional[Any] = None
+
+
+parse_block_schema = {
+    "name": "parse_block",
+    "description": (
+        "Parse or unify raw user text into a structured 'parsed_item'. "
+        "No disclaimers, just JSON with 'raw_text' and optionally 'parsed_item'."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "raw_text": {
+                "type": "string",
+                "description": "The raw text we want to parse"
+            },
+            "explanation": {
+                "type": "string",
+                "description": "Short reasoning or explanation"
+            },
+            "parsed_item": {
+                "type": "object",
+                "description": "Structured object if needed, e.g. {'name':'Joghurt', 'quantity':2, ...}",
+                "additionalProperties": True
+            }
+        },
+        "required": ["raw_text"],
+        "additionalProperties": False
+    }
+}
+
+
+#
+# Gather them all
+#
+ALL_FUNCTION_SCHEMAS = [
+    plan_tasks_schema,
+    sql_block_schema,
+    output_block_schema,
+    parse_block_schema
+]

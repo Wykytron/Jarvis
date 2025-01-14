@@ -23,9 +23,12 @@ export default function SettingsScreen() {
         style={{ color: 'black', backgroundColor: 'white' }}
         itemStyle={{ color: 'black' }}
       >
-        {/* Replace with whatever text-based models you want */}
-        <Picker.Item label="GPT-3.5 Turbo" value="gpt-3.5-turbo" />
-        <Picker.Item label="GPT-4" value="gpt-4" />
+        {/* Replace or add any text-based models you want */}
+        <Picker.Item label="GPT-3.5 Turbo"        value="gpt-3.5-turbo" />
+        <Picker.Item label="GPT-3.5 Turbo (16k)"  value="gpt-3.5-turbo-16k" />
+        <Picker.Item label="GPT-4"               value="gpt-4" />
+        <Picker.Item label="GPT-4 (0613)"        value="gpt-4-0613" />
+        {/* or add more if needed */}
       </Picker>
 
       {/* IMAGE MODEL PICKER */}
