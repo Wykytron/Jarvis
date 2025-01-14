@@ -60,6 +60,10 @@ def call_openai_plan(user_request: str, debug_info: list, task_memory: dict) -> 
         try:
             data = json.loads(fn_args_str)
             plan_args = PlanTasksArguments(**data)
+
+            logger.info(f"[call_openai_plan] Final plan => {plan_args.tasks}")
+            debug_info.append(f"[plan] tasks => {plan_args.tasks}")
+
             return plan_args
         except Exception as e:
             debug_info.append(f"[plan] parse error => {e}")
@@ -74,6 +78,10 @@ def call_openai_plan(user_request: str, debug_info: list, task_memory: dict) -> 
             if "name" in candidate and "arguments" in candidate:
                 plan_args_data = candidate["arguments"]
                 plan_args = PlanTasksArguments(**plan_args_data)
+
+                logger.info(f"[call_openai_plan] Final plan => {plan_args.tasks}")
+                debug_info.append(f"[plan] tasks => {plan_args.tasks}")
+                
                 return plan_args
         except:
             pass
