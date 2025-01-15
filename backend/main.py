@@ -11,12 +11,13 @@ from datetime import datetime
 from database import SessionLocal, ChatExchange, Document
 from vectorstore import ingest_document, query_docs
 from parser_utils import parse_file
-
-# Import the orchestrator "run_agent"
-from agent.orchestrator import run_agent
-
 import openai
 import logging
+
+from agent.global_store import TABLE_SCHEMAS, CURRENT_DATETIME_FN, get_now
+
+# (1) Import your dynamic_schema
+#from .dynamic_schema import build_table_schemas
 
 load_dotenv()
 openai.api_key = os.getenv("OPENAI_API_KEY")
@@ -32,7 +33,23 @@ logging.basicConfig(
 )
 logger = logging.getLogger("agent")
 
+# GLOBALS:
 
+@app.on_event("startup")
+def startup_event():
+    """
+    Here we dynamically build the schema info, etc.
+    """
+    # 1) Build or load dynamic schema
+    from dynamic_schema import build_table_schemas
+    new_schema = build_table_schemas()
+
+    # Assign to global_store variables
+    from agent.global_store import TABLE_SCHEMAS, CURRENT_DATETIME_FN
+    TABLE_SCHEMAS.clear()
+    TABLE_SCHEMAS.update(new_schema)
+
+    CURRENT_DATETIME_FN = get_now
 ###############################################################################
 # 1) /api/image_recognize
 ###############################################################################
@@ -91,6 +108,7 @@ async def image_recognize_endpoint(
             return {"error": f"Model call failed: {str(e)}"}
 
         # (E) Parse <Title>, <Description>, <Response>
+        import re
         title_match = re.search(r"<Title>(.*?)</Title>", llm_text, re.DOTALL)
         desc_match = re.search(r"<Description>(.*?)</Description>", llm_text, re.DOTALL)
         resp_match = re.search(r"<Response>(.*?)</Response>", llm_text, re.DOTALL)
@@ -301,12 +319,17 @@ def search_docs_endpoint(
 # 6) /api/agent => The new Agent endpoint
 ###############################################################################
 @app.post("/api/agent")
-def agent_endpoint(user_input: str = Body(..., embed=True), chosen_model: str = Body("gpt-3.5-turbo", embed=True)):
+def agent_endpoint(
+    user_input: str = Body(..., embed=True),
+    chosen_model: str = Body("gpt-3.5-turbo", embed=True)
+):
     logger.info(f"Received user_input for agent: {user_input}")
-    # If the frontend sends a model name in the same payload, store it in memory so orchestrator can use it
     task_memory = {}
     if chosen_model and chosen_model.strip():
         task_memory["agent_model"] = chosen_model.strip()
+
+    # import here to avoid top-level cyclical references
+    from agent.orchestrator import run_agent
 
     final_answer, debug_info = run_agent(user_input, task_memory)
     logger.info(f"Final answer from agent: {final_answer}")
