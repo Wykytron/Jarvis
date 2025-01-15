@@ -225,6 +225,8 @@ def build_system_prompt_for_block(block_name: str, block_description: str, task_
         return (
             "You are 'sql_block'. You produce { table_name, columns, values, action_type, explanation }.\n"
             "If you do an INSERT, please supply all needed columns. If user didn't specify, use 'misc' or default.\n"
+            "For UPDATE or DELETE, you MUST provide where_clause, e.g. \"WHERE name='tomatoes'\".\n\n"
+            "If action_type=DELETE, you must provide a where_clause. If the user only says “Delete X,” produce where_clause: \"WHERE name='X'\". No disclaimers.\n"
             "Use EXACT existing table names from the schema below. If you do an INSERT, supply all needed columns.\n"
             + db_schema_str
             + "\n"  # separate line
@@ -238,6 +240,7 @@ def build_system_prompt_for_block(block_name: str, block_description: str, task_
             '     "values": [...],\n'
             '     "action_type": "...",\n'
             '     "explanation": "..." \n'
+            '     "where_clause": "..." \n'
             '  }\n'
             "}\n\n"
             f"task_memory => {json.dumps(task_memory, default=str)}"
@@ -257,14 +260,10 @@ def build_system_prompt_for_block(block_name: str, block_description: str, task_
 
 
 def run_agent(user_input: str, initial_task_memory: dict = None):
-    """
-    Main orchestrator entrypoint. We let the user optionally provide an initial_task_memory
-    that might hold 'agent_model' or other settings (like from your main.py 'chosen_model').
-    """
     debug_info = []
     if not initial_task_memory:
         initial_task_memory = {}
-    # Combine the user_input + the initial_task_memory
+
     task_memory = {"original_user_input": user_input, **initial_task_memory}
 
     # 1) Plan
@@ -273,22 +272,56 @@ def run_agent(user_input: str, initial_task_memory: dict = None):
         return ("Could not plan tasks. Possibly clarify your request.", debug_info)
 
     final_answer = "(No final answer produced)"
+    output_block_triggered = False
 
     # 2) Execute steps
     for step in plan_result.tasks:
         block = step.block
         desc = step.description
         res = call_block_llm(block, desc, task_memory, debug_info)
+
         task_memory[f"last_{block}_result"] = res
 
-        # if it's output_block, see if final_answer is there
+        # If it's the output_block, record final_answer
         if block == "output_block":
+            output_block_triggered = True
             if "final_answer" in res:
                 final_answer = res["final_answer"]
             else:
-                fm = res.get("final_message", "")
+                # fallback check for "final_message"
+                fm = res.get("final_message","")
                 if fm:
                     final_answer = fm
-            break
+            break  # usually we stop after output_block
+
+    # 3) If no output_block was triggered, do a fallback
+    if not output_block_triggered:
+        # Possibly check last_sql_block_result for success/failure, rowcount, etc.
+        # then produce a minimal fallback:
+        last_sql_res = task_memory.get("last_sql_block_result", {})
+        if "error" in last_sql_res:
+            final_answer = (
+                "Sorry, an error occurred with your request:\n"
+                f"{last_sql_res['error']}"
+            )
+        else:
+            # either row_affected, row_count, or no DB call
+            if "rows_affected" in last_sql_res:
+                # if row_affected=0 => partial success or no row changed
+                ra = last_sql_res["rows_affected"]
+                if ra == 0:
+                    final_answer = "No rows changed. Possibly the item wasn't found."
+                else:
+                    final_answer = "Success. The item was changed in the DB."
+            elif "rows_count" in last_sql_res:
+                # e.g. SELECT
+                rc = last_sql_res["rows_count"]
+                if rc == 0:
+                    final_answer = "No items found."
+                else:
+                    final_answer = f"Found {rc} item(s)."
+            else:
+                # no DB call => fallback
+                final_answer = "Operation completed, but no final message was produced."
 
     return (final_answer, debug_info)

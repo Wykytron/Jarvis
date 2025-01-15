@@ -16,6 +16,7 @@ We have these blocks you can use:
 3) **parse_block**
    - Purpose: Parse or unify user text into structured data, e.g. extracting item names from raw text.
    - No disclaimers—only function-calling with `"name": "parse_block"`.
+   - Use this before any SQL block if input data is not well structured.
 
 Constraints:
 - Return exactly one function call to `"plan_tasks"` with `"tasks"`: a list of objects.

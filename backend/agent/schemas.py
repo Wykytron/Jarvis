@@ -70,6 +70,10 @@ sql_block_schema = {
             "explanation": {
                 "type": "string",
                 "description": "Short explanation or reasoning behind the query"
+            },
+            "where_clause": {
+                "type": "string",
+                "description": "Optional WHERE clause if we do an UPDATE or DELETE, e.g. \"WHERE name='tomatoes'\""
             }
         },
         "required": ["table_name","columns","values","action_type"],
