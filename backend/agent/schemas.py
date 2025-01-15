@@ -3,7 +3,6 @@
 from typing import List, Optional, Literal, Any
 from pydantic import BaseModel
 
-
 #
 # 1) plan_tasks
 #
@@ -13,10 +12,8 @@ class PlanTaskItem(BaseModel):
     title: str
     reasoning: str = ""
 
-
 class PlanTasksArguments(BaseModel):
     tasks: List[PlanTaskItem]
-
 
 plan_tasks_schema = {
     "name": "plan_tasks",
@@ -27,17 +24,16 @@ plan_tasks_schema = {
     "parameters": PlanTasksArguments.schema()
 }
 
-
 #
-# 2) sql_block (Method A)
+# 2) sql_block
 #
 class SQLBlockArguments(BaseModel):
     table_name: str
-    columns: List[str]    # e.g. ["name","quantity","unit","expiration_date","category"]
-    values: List[str]     # e.g. ["'Joghurt'","2","'unit'","'2025-01-25'","'dairy'"]
+    columns: List[str]  # e.g. ["name","quantity","unit","expiration_date","category"]
+    values: List[str]   # e.g. ["'Joghurt'","2","'unit'","'2025-01-25'","'dairy'"]
     action_type: Literal["SELECT", "INSERT", "UPDATE", "DELETE"]
     explanation: str = ""
-
+    where_clause: Optional[str] = None  # for updates/deletes
 
 sql_block_schema = {
     "name": "sql_block",
@@ -49,31 +45,23 @@ sql_block_schema = {
     "parameters": {
         "type": "object",
         "properties": {
-            "table_name": {
-                "type": "string",
-                "description": "Target DB table, e.g. fridge_items or shopping_items"
-            },
+            "table_name": {"type": "string"},
             "columns": {
                 "type": "array",
-                "items": {"type": "string"},
-                "description": "Which columns to read/write, e.g. ['name','quantity','unit','expiration_date','category']"
+                "items": {"type": "string"}
             },
             "values": {
                 "type": "array",
-                "items": {"type": "string"},
-                "description": "Matching values, e.g. ['Joghurt','2','Units','2025-01-25','Dairy']"
+                "items": {"type": "string"}
             },
             "action_type": {
                 "type": "string",
                 "enum": ["SELECT","INSERT","UPDATE","DELETE"]
             },
-            "explanation": {
-                "type": "string",
-                "description": "Short explanation or reasoning behind the query"
-            },
+            "explanation": {"type": "string"},
             "where_clause": {
                 "type": "string",
-                "description": "Optional WHERE clause if we do an UPDATE or DELETE, e.g. \"WHERE name='tomatoes'\""
+                "description": "e.g. WHERE name='tomatoes'"
             }
         },
         "required": ["table_name","columns","values","action_type"],
@@ -81,13 +69,11 @@ sql_block_schema = {
     }
 }
 
-
 #
 # 3) output_block
 #
 class OutputBlockArguments(BaseModel):
     final_message: str
-
 
 output_block_schema = {
     "name": "output_block",
@@ -105,7 +91,6 @@ output_block_schema = {
     }
 }
 
-
 #
 # 4) parse_block
 #
@@ -113,29 +98,28 @@ class ParseBlockArguments(BaseModel):
     raw_text: str
     explanation: Optional[str] = ""
     parsed_item: Optional[Any] = None
-
+    # NEW: allow the LLM to pass db_rows if it wants
+    db_rows: Optional[List[Any]] = None
 
 parse_block_schema = {
     "name": "parse_block",
     "description": (
-        "Parse or unify raw user text into a structured 'parsed_item'. "
-        "No disclaimers, just JSON with 'raw_text' and optionally 'parsed_item'."
+        "Parse or unify raw user text AND optionally DB data (db_rows) into a 'parsed_item'. "
+        "No disclaimers, just JSON with 'raw_text', 'parsed_item', and optionally 'db_rows'."
     ),
     "parameters": {
         "type": "object",
         "properties": {
-            "raw_text": {
-                "type": "string",
-                "description": "The raw text we want to parse"
-            },
-            "explanation": {
-                "type": "string",
-                "description": "Short reasoning or explanation"
-            },
+            "raw_text": {"type": "string"},
+            "explanation": {"type": "string"},
             "parsed_item": {
                 "type": "object",
-                "description": "Structured object if needed, e.g. {'name':'Joghurt', 'quantity':2, ...}",
-                "additionalProperties": True
+                "description": "structured object if needed"
+            },
+            "db_rows": {
+                "type": "array",
+                "items": {"type": "object"},
+                "description": "If we need to parse/fill data from a prior SELECT query"
             }
         },
         "required": ["raw_text"],
@@ -143,13 +127,114 @@ parse_block_schema = {
     }
 }
 
+#
+# 5) batch_insert_block
+#
+class BatchInsertRow(BaseModel):
+    columns: List[str]
+    values: List[str]
 
-#
-# Gather them all
-#
+class BatchInsertBlockArguments(BaseModel):
+    table_name: str
+    rows: List[BatchInsertRow]
+    explanation: str = ""
+
+batch_insert_block_schema = {
+    "name": "batch_insert_block",
+    "description": (
+        "Insert multiple rows into one table in a single call. "
+        "No disclaimers, only valid JSON. "
+        "If user says 'Add multiple items at once', produce an array of {columns, values}."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "table_name": {"type": "string"},
+            "rows": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "columns": {
+                            "type": "array",
+                            "items": {"type": "string"}
+                        },
+                        "values": {
+                            "type": "array",
+                            "items": {"type": "string"}
+                        }
+                    },
+                    "required": ["columns","values"]
+                }
+            },
+            "explanation": {"type": "string"}
+        },
+        "required": ["table_name","rows"],
+        "additionalProperties": False
+    }
+}
+
+class BatchUpdateRow(BaseModel):
+    where_clause: str            # e.g. "WHERE id=6"
+    columns: List[str]
+    values: List[str]
+
+class BatchUpdateBlockArguments(BaseModel):
+    table_name: str
+    rows: List[BatchUpdateRow]
+    explanation: str = ""
+
+batch_update_block_schema = {
+    "name": "batch_update_block",
+    "description": (
+        "Update multiple rows in one table in a single call. "
+        "If user says 'Update multiple fridge items at once', produce an array of row updates."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "table_name": {
+                "type": "string",
+                "description": "e.g. 'fridge_items'"
+            },
+            "rows": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "where_clause": {
+                            "type": "string",
+                            "description": "WHERE clause, e.g. 'WHERE id=7'"
+                        },
+                        "columns": {
+                            "type": "array",
+                            "items": {"type": "string"}
+                        },
+                        "values": {
+                            "type": "array",
+                            "items": {"type": "string"}
+                        }
+                    },
+                    "required": ["where_clause","columns","values"]
+                },
+                "description": "List of row-level updates"
+            },
+            "explanation": {
+                "type": "string",
+                "description": "Reasoning or comment about these updates"
+            }
+        },
+        "required": ["table_name","rows"],
+        "additionalProperties": False
+    }
+}
+
+
 ALL_FUNCTION_SCHEMAS = [
     plan_tasks_schema,
     sql_block_schema,
     output_block_schema,
-    parse_block_schema
+    parse_block_schema,
+    batch_insert_block_schema,
+    batch_update_block_schema
 ]

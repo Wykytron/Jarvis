@@ -1,9 +1,9 @@
 import os
 
-# Change this to your actual project path if needed.
+# Adjust to your actual base path if needed
 BASE_PATH = r"C:\Projects\Jarvis\v0.2"
 
-# We define which files to include for each “mode.”
+# Dictionary for the Backend mode
 BACKEND_FILES = {
     "database.py": os.path.join(BASE_PATH, "backend", "database.py"),
     "main.py": os.path.join(BASE_PATH, "backend", "main.py"),
@@ -12,43 +12,31 @@ BACKEND_FILES = {
     "schemas.py": os.path.join(BASE_PATH, "backend", "agent", "schemas.py"),
 }
 
+# Dictionary for the Frontend mode
 FRONTEND_FILES = {
     "App.tsx": os.path.join(BASE_PATH, "frontend", "App.tsx"),
     "HomeScreen.tsx": os.path.join(BASE_PATH, "frontend", "screens", "HomeScreen.tsx"),
     "SettingsScreen.tsx": os.path.join(BASE_PATH, "frontend", "screens", "SettingsScreen.tsx"),
 }
 
-# A small helper that returns the relevant folder structure for each “mode.”
+# Dictionary for the custom mode: we want orchestrator.py, blocks.py, schemas.py,
+# plus plan_prompt.md (which must be last).
+# We'll keep plan_prompt.md separate so we can ensure it's appended last.
+CUSTOM_FILES = {
+    "orchestrator.py": os.path.join(BASE_PATH, "backend", "agent", "orchestrator.py"),
+    "blocks.py": os.path.join(BASE_PATH, "backend", "agent", "blocks.py"),
+    "schemas.py": os.path.join(BASE_PATH, "backend", "agent", "schemas.py"),
+    # We'll handle plan_prompt.md outside this dictionary so it always goes last.
+}
+PLAN_PROMPT_MD = os.path.join(BASE_PATH, "backend", "agent", "prompts", "plan_prompt.md")
+
 def get_folder_structure(mode: str) -> str:
     """
     Returns a concise folder structure string that includes only
     the relevant files for the given mode.
     """
-    # Common indentation for readability:
     indent = "    "
-
-    # Base structure (only show what matters for these files)
-    base = [
-        "v0.2/",
-        f"{indent}backend/",
-        f"{indent}{indent}database.py",
-        f"{indent}{indent}main.py",
-        f"{indent}{indent}agent/",
-        f"{indent}{indent}{indent}blocks.py",
-        f"{indent}{indent}{indent}orchestrator.py",
-        f"{indent}{indent}{indent}schemas.py",
-        "",
-        f"{indent}frontend/",
-        f"{indent}{indent}App.tsx",
-        f"{indent}{indent}screens/",
-        f"{indent}{indent}{indent}HomeScreen.tsx",
-        f"{indent}{indent}{indent}SettingsScreen.tsx",
-    ]
-    # Convert to string
-    full_structure = "\n".join(base)
-
     if mode == "backend":
-        # Return only backend portion
         return (
             "v0.2/\n"
             + f"{indent}backend/\n"
@@ -60,7 +48,6 @@ def get_folder_structure(mode: str) -> str:
             + f"{indent}{indent}{indent}schemas.py\n"
         )
     elif mode == "frontend":
-        # Return only frontend portion
         return (
             "v0.2/\n"
             + f"{indent}frontend/\n"
@@ -69,10 +56,36 @@ def get_folder_structure(mode: str) -> str:
             + f"{indent}{indent}{indent}HomeScreen.tsx\n"
             + f"{indent}{indent}{indent}SettingsScreen.tsx\n"
         )
+    elif mode == "both":
+        # Show all relevant files for backend + frontend
+        return (
+            "v0.2/\n"
+            + f"{indent}backend/\n"
+            + f"{indent}{indent}database.py\n"
+            + f"{indent}{indent}main.py\n"
+            + f"{indent}{indent}agent/\n"
+            + f"{indent}{indent}{indent}blocks.py\n"
+            + f"{indent}{indent}{indent}orchestrator.py\n"
+            + f"{indent}{indent}{indent}schemas.py\n"
+            + "\n"
+            + f"{indent}frontend/\n"
+            + f"{indent}{indent}App.tsx\n"
+            + f"{indent}{indent}screens/\n"
+            + f"{indent}{indent}{indent}HomeScreen.tsx\n"
+            + f"{indent}{indent}{indent}SettingsScreen.tsx\n"
+        )
     else:
-        # “both” – return everything (backend + frontend)
-        return full_structure
-
+        # Custom mode: orchestrator.py, blocks.py, schemas.py, plan_prompt.md
+        return (
+            "v0.2/\n"
+            + f"{indent}backend/\n"
+            + f"{indent}{indent}agent/\n"
+            + f"{indent}{indent}{indent}orchestrator.py\n"
+            + f"{indent}{indent}{indent}blocks.py\n"
+            + f"{indent}{indent}{indent}schemas.py\n"
+            + f"{indent}{indent}{indent}prompts/\n"
+            + f"{indent}{indent}{indent}{indent}plan_prompt.md\n"
+        )
 
 def get_system_prompt() -> str:
     """
@@ -86,20 +99,31 @@ def get_system_prompt() -> str:
         "information or partial content that was not provided.\n"
     )
 
-
-def gather_files(mode: str) -> dict:
+def gather_files(mode: str) -> list:
     """
-    Given the mode (“backend”, “frontend”, or “both”), return a dict of {filename: path}
-    for the relevant files.
+    Given the mode (“backend”, “frontend”, “both”, or “custom”),
+    return a list of tuples [(filename, path), ...] for the relevant files.
+
+    For 'custom', we always put plan_prompt.md at the end.
     """
-    selected = {}
-    if mode in ("backend", "both"):
-        selected.update(BACKEND_FILES)
-    if mode in ("frontend", "both"):
-        selected.update(FRONTEND_FILES)
+    if mode == "backend":
+        files = list(BACKEND_FILES.items())  # -> [("database.py", "C:/...database.py"), ...]
+    elif mode == "frontend":
+        files = list(FRONTEND_FILES.items())
+    elif mode == "both":
+        # Merge both dictionaries
+        merged = {}
+        merged.update(BACKEND_FILES)
+        merged.update(FRONTEND_FILES)
+        files = list(merged.items())
+    else:
+        # Custom mode
+        custom_list = list(CUSTOM_FILES.items())
+        # Insert plan_prompt.md last
+        custom_list.append(("plan_prompt.md", PLAN_PROMPT_MD))
+        files = custom_list
 
-    return selected
-
+    return files
 
 def combine_files(mode: str, output_filename: str = "combined_prompt.txt"):
     """
@@ -108,29 +132,24 @@ def combine_files(mode: str, output_filename: str = "combined_prompt.txt"):
       2. A limited folder structure (only relevant to the chosen mode)
       3. The concatenated contents of each file in the chosen mode
     """
-    # 1. Grab system prompt text
     system_text = get_system_prompt()
-
-    # 2. Grab folder structure
     folder_structure = get_folder_structure(mode)
-
-    # 3. Get the dictionary of files (filename -> absolute path)
     files_to_combine = gather_files(mode)
 
     with open(output_filename, "w", encoding="utf-8") as out:
-        # Write the system prompt
+        # 1) Write the system prompt
         out.write("=== SYSTEM PROMPT ===\n")
         out.write(system_text.strip())
         out.write("\n\n")
 
-        # Write the folder structure
+        # 2) Write the folder structure
         out.write("=== FOLDER STRUCTURE (SELECTED) ===\n")
         out.write(folder_structure.strip())
         out.write("\n\n")
 
-        # Write the files
+        # 3) Write the files
         out.write("=== FILE CONTENTS ===\n")
-        for fname, fpath in files_to_combine.items():
+        for fname, fpath in files_to_combine:
             out.write(f"\n--- {fname} ---\n")
             try:
                 with open(fpath, "r", encoding="utf-8") as f:
@@ -138,21 +157,22 @@ def combine_files(mode: str, output_filename: str = "combined_prompt.txt"):
             except Exception as e:
                 out.write(f"[Error reading {fpath}: {e}]")
 
-
 if __name__ == "__main__":
     print("Which files do you want to combine?")
     print("1) Backend only")
     print("2) Frontend only")
     print("3) Both backend and frontend")
-    choice = input("Enter 1, 2, or 3: ").strip()
+    print("4) Custom selection (orchestrator.py, blocks.py, schemas.py, plan_prompt.md)")
+    choice = input("Enter 1, 2, 3, or 4: ").strip()
 
     if choice == "1":
         mode = "backend"
     elif choice == "2":
         mode = "frontend"
-    else:
+    elif choice == "3":
         mode = "both"
+    else:
+        mode = "custom"
 
-    # Generate the combined prompt file
-    combine_files(mode, output_filename="combined_prompt.txt")
+    combine_files(mode)
     print(f"Done! Created 'combined_prompt.txt' for mode: {mode}")

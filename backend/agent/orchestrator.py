@@ -8,21 +8,26 @@ import openai
 from openai import OpenAI
 
 from .schemas import ALL_FUNCTION_SCHEMAS, PlanTasksArguments
-from .blocks import handle_parse_block, handle_sql_block, handle_output_block
-
-# IMPORTANT: import from global_store, not from main
+from .blocks import (
+    handle_parse_block,
+    handle_sql_block,
+    handle_output_block,
+    handle_batch_insert_block,
+    handle_batch_update_block  # <-- NEW: import the new batch_update handler
+)
 from agent.global_store import TABLE_SCHEMAS, CURRENT_DATETIME_FN
 
 logger = logging.getLogger("agent")
 
-
 def call_openai_plan(user_request: str, debug_info: list, task_memory: dict) -> PlanTasksArguments:
+    """
+    Calls GPT with plan instructions to produce a short JSON plan { tasks: [...] }.
+    """
     base_dir = os.path.dirname(os.path.abspath(__file__))
     plan_path = os.path.join(base_dir, "prompts", "plan_prompt.md")
     with open(plan_path, "r", encoding="utf-8") as f:
         plan_instructions = f.read()
 
-    # We'll pick up the model from task_memory
     model_name = task_memory.get("agent_model", "gpt-4-0613")
 
     messages = [
@@ -61,6 +66,7 @@ def call_openai_plan(user_request: str, debug_info: list, task_memory: dict) -> 
             logger.warning(f"[call_openai_plan] parse error => {e}")
             return PlanTasksArguments(tasks=[])
     else:
+        # fallback parse if no function_call
         content_str = choice.message.content or ""
         debug_info.append(f"[plan] no function_call, content => {content_str}")
         try:
@@ -77,7 +83,130 @@ def call_openai_plan(user_request: str, debug_info: list, task_memory: dict) -> 
         return PlanTasksArguments(tasks=[])
 
 
+def build_system_prompt_for_block(block_name: str, block_description: str, task_memory: dict) -> str:
+    """
+    Provide specialized instructions for each block.
+    Now we also handle 'batch_insert_block' and 'batch_update_block' with short schema notes.
+    And mention parse_block can parse DB rows if needed.
+    """
+    from agent.global_store import TABLE_SCHEMAS, CURRENT_DATETIME_FN
+
+    if block_name == "parse_block":
+        user_req = task_memory.get("original_user_input", "")
+        date_str = ""
+        if CURRENT_DATETIME_FN:
+            dt_now = CURRENT_DATETIME_FN()
+            date_str = f"Current date/time => {dt_now.isoformat()}\n"
+
+        target_table = task_memory.get("target_table", "(none)")
+        table_cols = TABLE_SCHEMAS.get(target_table, [])
+        col_list_str = ", ".join(table_cols)
+
+        last_rows = task_memory.get("last_sql_rows", [])
+        last_rows_str = json.dumps(last_rows, default=str)
+
+        return (
+            "You are the 'parse_block'. You can parse or unify user text AND/OR data from the DB.\n"
+            "If 'db_rows' is provided, unify or fill columns. If user says '1 liter', parse quantity=1.0, unit='liter'.\n"
+            "If user says 'expires next week', convert to a date offset.\n"
+            "Return function_call => { raw_text:'...', explanation:'...', db_rows:..., parsed_item:{...} }.\n\n"
+            f"{date_str}"
+            f"Target table => {target_table}\n"
+            f"Columns => {col_list_str}\n"
+            f"last_sql_rows => {last_rows_str}\n"
+            f"user_input => {user_req}\n"
+            f"task_memory => {json.dumps(task_memory, default=str)}"
+        )
+
+    elif block_name == "sql_block":
+        db_schema_str = (
+            "Here is your DB schema:\n"
+            "- fridge_items:\n"
+            "   columns => [id, name, quantity, unit, expiration_date, category] (ALWAYS_ALLOW)\n"
+            "- shopping_items:\n"
+            "   columns => [id, name, desired_quantity, unit, purchased] (ALWAYS_ALLOW)\n"
+            "- invoices:\n"
+            "   columns => [id, date, total_amount, store_name] (REQUIRE_USER)\n"
+            "- invoice_items:\n"
+            "   columns => [id, invoice_id, name, quantity, price_per_unit] (REQUIRE_USER)\n"
+            "- monthly_spendings:\n"
+            "   columns => [id, year_month, total_spent] (ALWAYS_DENY)\n"
+        )
+        return (
+            "You are 'sql_block'. You produce JSON => { table_name, columns, values, action_type, explanation, [where_clause] }.\n"
+            "If user says 'delete X', do DELETE with a proper where_clause.\n"
+            "If user says 'update X', do UPDATE with a proper where_clause.\n"
+            "You MUST always provide a where_clause if action_type=DELETE or UPDATE.\n\n"
+            + db_schema_str
+            + "\n"
+            + "task_memory => "
+            + json.dumps(task_memory, default=str)
+        )
+
+    elif block_name == "output_block":
+        last_sql = task_memory.get("last_sql_block_result", {})
+        return (
+            "You are 'output_block'. Summarize or finalize the answer.\n"
+            "Override if rowcount=0 => say 'No items found or changed', or if there's an error.\n"
+            f"last_sql_block_result => {json.dumps(last_sql, default=str)}\n"
+            f"task_memory => {json.dumps(task_memory, default=str)}"
+        )
+
+    elif block_name == "batch_insert_block":
+        db_schema_str = (
+            "Here is your DB schema:\n"
+            "- fridge_items:\n"
+            "   columns => [id, name, quantity, unit, expiration_date, category] (ALWAYS_ALLOW)\n"
+            "- shopping_items:\n"
+            "   columns => [id, name, desired_quantity, unit, purchased] (ALWAYS_ALLOW)\n"
+            "- invoices:\n"
+            "   columns => [id, date, total_amount, store_name] (REQUIRE_USER)\n"
+            "- invoice_items:\n"
+            "   columns => [id, invoice_id, name, quantity, price_per_unit] (REQUIRE_USER)\n"
+            "- monthly_spendings:\n"
+            "   columns => [id, year_month, total_spent] (ALWAYS_DENY)\n"
+        )
+        return (
+            "You are 'batch_insert_block'. You receive { table_name, rows:[{columns, values},...], explanation}.\n"
+            "Insert multiple rows into the DB.\n\n"
+            + db_schema_str
+            + "\n"
+            + "task_memory => "
+            + json.dumps(task_memory, default=str)
+        )
+
+    elif block_name == "batch_update_block":  # <--- NEW
+        db_schema_str = (
+            "Here is your DB schema:\n"
+            "- fridge_items:\n"
+            "   columns => [id, name, quantity, unit, expiration_date, category] (ALWAYS_ALLOW)\n"
+            "- shopping_items:\n"
+            "   columns => [id, name, desired_quantity, unit, purchased] (ALWAYS_ALLOW)\n"
+            "- invoices:\n"
+            "   columns => [id, date, total_amount, store_name] (REQUIRE_USER)\n"
+            "- invoice_items:\n"
+            "   columns => [id, invoice_id, name, quantity, price_per_unit] (REQUIRE_USER)\n"
+            "- monthly_spendings:\n"
+            "   columns => [id, year_month, total_spent] (ALWAYS_DENY)\n"
+        )
+        return (
+            "You are 'batch_update_block'. You receive { table_name, rows:[{where_clause, columns, values},...], explanation}.\n"
+            "Update multiple rows in a single call. If user says 'Update these items at once,' produce multiple row objects.\n\n"
+            + db_schema_str
+            + "\n"
+            + "task_memory => "
+            + json.dumps(task_memory, default=str)
+        )
+
+    else:
+        return f"You are block={block_name}, partial memory => {json.dumps(task_memory, default=str)}"
+
+
 def call_block_llm(block_name: str, block_description: str, task_memory: dict, debug_info: list):
+    """
+    Calls GPT with the appropriate function schema.
+    Then dispatches to the matching handler: parse_block, sql_block, etc.
+    """
     logger.info(f"[call_block_llm] block={block_name}, desc={block_description}")
     debug_info.append(f"[block_llm] block={block_name}, desc={block_description}")
 
@@ -86,6 +215,7 @@ def call_block_llm(block_name: str, block_description: str, task_memory: dict, d
         if s["name"] == block_name:
             schema = s
             break
+
     if not schema:
         msg = f"No schema found for block={block_name}"
         debug_info.append(msg)
@@ -112,7 +242,6 @@ def call_block_llm(block_name: str, block_description: str, task_memory: dict, d
     choice = resp.choices[0]
     fn_call = choice.message.function_call
     if not fn_call:
-        # fallback parse
         content_str = choice.message.content or ""
         debug_info.append(f"[block_llm] no function_call => fallback parse content = {content_str}")
         try:
@@ -144,20 +273,30 @@ def dispatch_block(block_name: str, args_data: dict, task_memory: dict, debug_in
     logger.info(f"[dispatch_block] block={block_name}, args={args_data}")
     debug_info.append(f"[dispatch_block] block={block_name}, args={args_data}")
 
-    # If we see a target table in the block description, store in task_memory so parse_block can see it
-    # If the block is "sql_block", we can parse the "table_name" from args_data
-    if block_name == "sql_block" and "table_name" in args_data:
+    if ("table_name" in args_data
+        and block_name in ["sql_block","batch_insert_block","batch_update_block"]):
         guessed_table = args_data["table_name"]
         debug_info.append(f"[dispatch_block] Setting target_table => {guessed_table}")
         task_memory["target_table"] = guessed_table
 
-    from .blocks import handle_parse_block, handle_sql_block, handle_output_block
+    from .blocks import (
+        handle_parse_block,
+        handle_sql_block,
+        handle_output_block,
+        handle_batch_insert_block,
+        handle_batch_update_block  # <-- NEW
+    )
+
     if block_name == "parse_block":
         return handle_parse_block(args_data, task_memory, debug_info)
     elif block_name == "sql_block":
         return handle_sql_block(args_data, task_memory, debug_info)
     elif block_name == "output_block":
         return handle_output_block(args_data, task_memory, debug_info)
+    elif block_name == "batch_insert_block":
+        return handle_batch_insert_block(args_data, task_memory, debug_info)
+    elif block_name == "batch_update_block":  # <-- NEW
+        return handle_batch_update_block(args_data, task_memory, debug_info)
     else:
         msg = f"Unrecognized block => {block_name}"
         debug_info.append(msg)
@@ -165,85 +304,15 @@ def dispatch_block(block_name: str, args_data: dict, task_memory: dict, debug_in
         return {"error": msg}
 
 
-def build_system_prompt_for_block(block_name: str, block_description: str, task_memory: dict) -> str:
-    """
-    Provide specialized instructions for each block. 
-    No importing from main here — use agent.global_store if needed.
-    """
-    from agent.global_store import TABLE_SCHEMAS, CURRENT_DATETIME_FN
-    import datetime
-
-    if block_name == "parse_block":
-        user_req = task_memory.get("original_user_input", "")
-        date_str = ""
-        if CURRENT_DATETIME_FN:
-            now_dt = CURRENT_DATETIME_FN()
-            date_str = f"Current date/time => {now_dt.isoformat()}\n"
-
-        # Possibly mention the target_table columns
-        target_table = task_memory.get("target_table", "(none)")
-        table_cols = TABLE_SCHEMAS.get(target_table, [])
-        # Make a hint text
-        col_list_str = ", ".join(table_cols)
-
-        return (
-            "You are the 'parse_block'. You parse raw text into structured data { raw_text, parsed_item }.\n"
-            "No disclaimers. Return function_call => { raw_text:'...', explanation:'...', parsed_item:{...}}.\n"
-            "Fill in columns if user wants to insert or update. If user says '1 liter', parse quantity=1.0, unit='liter'.\n"
-            "If user says 'expires next week', convert to date offset.\n\n"
-            f"{date_str}"
-            f"Target table => {target_table}\n"
-            f"Columns => {col_list_str}\n"
-            f"user_input => {user_req}\n"
-            f"task_memory => {json.dumps(task_memory, default=str)}"
-        )
-
-    elif block_name == "sql_block":
-        # Provide partial or dynamic schema info
-        db_schema_str = (
-            "Here is your DB schema:\n"
-            "- fridge_items:\n"
-            "   columns => [id, name, quantity, unit, expiration_date, category] (ALWAYS_ALLOW)\n"
-            "- shopping_items:\n"
-            "   columns => [id, name, desired_quantity, unit, purchased] (ALWAYS_ALLOW)\n"
-            "- invoices:\n"
-            "   columns => [id, date, total_amount, store_name] (REQUIRE_USER)\n"
-            "- invoice_items:\n"
-            "   columns => [id, invoice_id, name, quantity, price_per_unit] (REQUIRE_USER)\n"
-            "- monthly_spendings:\n"
-            "   columns => [id, year_month, total_spent] (ALWAYS_DENY)\n"
-        )
-
-        return (
-            "You are 'sql_block'. You produce JSON => { table_name, columns, values, action_type, explanation, [where_clause] }.\n"
-            "No disclaimers. If user says 'delete X', do DELETE with where_clause.\n"
-            "If user says 'update X', do UPDATE with where_clause.\n\n"
-            + db_schema_str
-            + "\n"
-            "task_memory => "
-            + json.dumps(task_memory, default=str)
-        )
-
-    elif block_name == "output_block":
-        last_sql = task_memory.get("last_sql_block_result", {})
-        return (
-            "You are 'output_block'. Summarize or finalize the answer for the user.\n"
-            "Override if rowcount=0 => say 'No items found or changed', or if there's an error.\n"
-            f"last_sql_block_result => {json.dumps(last_sql, default=str)}\n"
-            f"task_memory => {json.dumps(task_memory, default=str)}"
-        )
-
-    else:
-        return f"You are block={block_name}, partial memory => {json.dumps(task_memory, default=str)}"
-
-
 def run_agent(user_input: str, initial_task_memory: dict = None):
+    """
+    Orchestrates the user request -> plan -> block calls -> final answer.
+    """
     debug_info = []
     if not initial_task_memory:
         initial_task_memory = {}
     task_memory = {"original_user_input": user_input, **initial_task_memory}
 
-    # 1) Plan
     plan_result = call_openai_plan(user_input, debug_info, task_memory)
     if not plan_result.tasks:
         return ("Could not plan tasks. Possibly clarify your request.", debug_info)
@@ -251,22 +320,17 @@ def run_agent(user_input: str, initial_task_memory: dict = None):
     final_answer = "(No final answer produced)"
     output_block_triggered = False
 
-    # 2) Execute steps
     for step in plan_result.tasks:
         block = step.block
         desc = step.description
 
-        # Optionally guess the table name from the step.description
-        # e.g. if "fridge_items" in desc => set target_table=fridge_items
-
-        # a quick hack:
+        # optional heuristic for target_table
         if "fridge_items" in desc.lower():
             task_memory["target_table"] = "fridge_items"
         elif "shopping_list" in desc.lower() or "shopping_items" in desc.lower():
             task_memory["target_table"] = "shopping_items"
         elif "invoice" in desc.lower():
             task_memory["target_table"] = "invoices"
-        # etc. (optional)
 
         result = call_block_llm(block, desc, task_memory, debug_info)
         task_memory[f"last_{block}_result"] = result
@@ -281,7 +345,6 @@ def run_agent(user_input: str, initial_task_memory: dict = None):
                     final_answer = fm
             break
 
-    # 3) Fallback if no output_block
     if not output_block_triggered:
         last_sql_res = task_memory.get("last_sql_block_result", {})
         if "error" in last_sql_res:
@@ -289,11 +352,16 @@ def run_agent(user_input: str, initial_task_memory: dict = None):
         else:
             ra = last_sql_res.get("rows_affected", None)
             rc = last_sql_res.get("rows_count", None)
-            if ra is not None:
+            rows_inserted = last_sql_res.get("rows_inserted", None)
+
+            if rows_inserted is not None:
+                if rows_inserted == 0:
+                    final_answer = "No rows were inserted (possible mismatch)."
+                else:
+                    final_answer = f"Successfully inserted {rows_inserted} rows."
+            elif ra is not None:
                 if ra == 0:
-                    final_answer = (
-                        "No matching items were found to update/delete. If you expected a change, please check the name."
-                    )
+                    final_answer = "No matching items were found to update/delete."
                 else:
                     final_answer = "Success. The DB was updated."
             elif rc is not None:
