@@ -282,6 +282,34 @@ batch_delete_block_schema = {
     }
 }
 
+class ChatBlockArguments(BaseModel):
+    user_prompt: str                 # The question or text the user (or system) wants to feed into chat
+    context: Optional[str] = None    # If we have an optional large context
+
+chat_block_schema = {
+    "name": "chat_block",
+    "description": (
+        "Perform an open-ended chat or reasoning step. "
+        "We supply 'user_prompt' plus optional 'context'. "
+        "In response, produce text in 'response_text' if needed."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "user_prompt": {
+                "type": "string",
+                "description": "The user or system query we want to chat or reason about"
+            },
+            "context": {
+                "type": "string",
+                "description": "Optional large context or relevant background we want to feed the model"
+            }
+        },
+        "required": ["user_prompt"],
+        "additionalProperties": False
+    }
+}
+
 ALL_FUNCTION_SCHEMAS = [
     plan_tasks_schema,
     sql_block_schema,
@@ -289,5 +317,6 @@ ALL_FUNCTION_SCHEMAS = [
     parse_block_schema,
     batch_insert_block_schema,
     batch_update_block_schema,
-    batch_delete_block_schema
+    batch_delete_block_schema,
+    chat_block_schema
 ]

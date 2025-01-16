@@ -29,11 +29,13 @@ from .blocks import (
     handle_sql_block,
     handle_output_block,
     handle_batch_insert_block,
-    handle_batch_update_block  # <-- NEW: import the new batch_update handler
+    handle_batch_update_block,
+    handle_batch_delete_block,  # <-- also import the new delete handler
 )
 from agent.global_store import TABLE_SCHEMAS, CURRENT_DATETIME_FN
 
 logger = logging.getLogger("agent")
+
 
 def call_openai_plan(user_request: str, debug_info: list, task_memory: dict) -> PlanTasksArguments:
     """
@@ -102,8 +104,8 @@ def call_openai_plan(user_request: str, debug_info: list, task_memory: dict) -> 
 def build_system_prompt_for_block(block_name: str, block_description: str, task_memory: dict) -> str:
     """
     Provide specialized instructions for each block.
-    Now we also handle 'batch_insert_block' and 'batch_update_block' with short schema notes.
-    And mention parse_block can parse DB rows if needed.
+    Now also handle batch_insert_block, batch_update_block, and batch_delete_block
+    with short schema notes. And mention parse_block can parse DB rows if needed.
     """
     from agent.global_store import TABLE_SCHEMAS, CURRENT_DATETIME_FN
 
@@ -191,7 +193,7 @@ def build_system_prompt_for_block(block_name: str, block_description: str, task_
             + json.dumps(task_memory, default=str)
         )
 
-    elif block_name == "batch_update_block":  # <--- NEW
+    elif block_name == "batch_update_block":
         db_schema_str = (
             "Here is your DB schema:\n"
             "- fridge_items:\n"
@@ -208,6 +210,30 @@ def build_system_prompt_for_block(block_name: str, block_description: str, task_
         return (
             "You are 'batch_update_block'. You receive { table_name, rows:[{where_clause, columns, values},...], explanation}.\n"
             "Update multiple rows in a single call. If user says 'Update these items at once,' produce multiple row objects.\n\n"
+            + db_schema_str
+            + "\n"
+            + "task_memory => "
+            + json.dumps(task_memory, default=str)
+        )
+
+    elif block_name == "batch_delete_block":  # <--- NEW
+        db_schema_str = (
+            "Here is your DB schema:\n"
+            "- fridge_items:\n"
+            "   columns => [id, name, quantity, unit, expiration_date, category] (ALWAYS_ALLOW)\n"
+            "- shopping_items:\n"
+            "   columns => [id, name, desired_quantity, unit, purchased] (ALWAYS_ALLOW)\n"
+            "- invoices:\n"
+            "   columns => [id, date, total_amount, store_name] (REQUIRE_USER)\n"
+            "- invoice_items:\n"
+            "   columns => [id, invoice_id, name, quantity, price_per_unit] (REQUIRE_USER)\n"
+            "- monthly_spendings:\n"
+            "   columns => [id, year_month, total_spent] (ALWAYS_DENY)\n"
+        )
+        return (
+            "You are 'batch_delete_block'. You receive { table_name, rows:[{where_clause}], explanation}.\n"
+            "Delete multiple rows in a single call. If user says 'Remove these items at once,' produce multiple row objects.\n"
+            "Each object must have 'where_clause', e.g. WHERE id=7 or WHERE name='spinach'.\n\n"
             + db_schema_str
             + "\n"
             + "task_memory => "
@@ -289,8 +315,9 @@ def dispatch_block(block_name: str, args_data: dict, task_memory: dict, debug_in
     logger.info(f"[dispatch_block] block={block_name}, args={args_data}")
     debug_info.append(f"[dispatch_block] block={block_name}, args={args_data}")
 
+    # If the block is a DB-related batch or single SQL, set target_table from the arguments
     if ("table_name" in args_data
-        and block_name in ["sql_block","batch_insert_block","batch_update_block"]):
+        and block_name in ["sql_block","batch_insert_block","batch_update_block","batch_delete_block"]):
         guessed_table = args_data["table_name"]
         debug_info.append(f"[dispatch_block] Setting target_table => {guessed_table}")
         task_memory["target_table"] = guessed_table
@@ -300,7 +327,8 @@ def dispatch_block(block_name: str, args_data: dict, task_memory: dict, debug_in
         handle_sql_block,
         handle_output_block,
         handle_batch_insert_block,
-        handle_batch_update_block  # <-- NEW
+        handle_batch_update_block,
+        handle_batch_delete_block,
     )
 
     if block_name == "parse_block":
@@ -311,8 +339,10 @@ def dispatch_block(block_name: str, args_data: dict, task_memory: dict, debug_in
         return handle_output_block(args_data, task_memory, debug_info)
     elif block_name == "batch_insert_block":
         return handle_batch_insert_block(args_data, task_memory, debug_info)
-    elif block_name == "batch_update_block":  # <-- NEW
+    elif block_name == "batch_update_block":
         return handle_batch_update_block(args_data, task_memory, debug_info)
+    elif block_name == "batch_delete_block":  # <-- NEW
+        return handle_batch_delete_block(args_data, task_memory, debug_info)
     else:
         msg = f"Unrecognized block => {block_name}"
         debug_info.append(msg)
@@ -336,11 +366,12 @@ def run_agent(user_input: str, initial_task_memory: dict = None):
     final_answer = "(No final answer produced)"
     output_block_triggered = False
 
+    # Execute each step in the plan
     for step in plan_result.tasks:
         block = step.block
         desc = step.description
 
-        # optional heuristic for target_table
+        # (Optional) guess table from step description, e.g. if it mentions "fridge_items"
         if "fridge_items" in desc.lower():
             task_memory["target_table"] = "fridge_items"
         elif "shopping_list" in desc.lower() or "shopping_items" in desc.lower():
@@ -353,6 +384,7 @@ def run_agent(user_input: str, initial_task_memory: dict = None):
 
         if block == "output_block":
             output_block_triggered = True
+            # The output_block should produce either "final_answer" or "final_message"
             if "final_answer" in result:
                 final_answer = result["final_answer"]
             else:
@@ -361,6 +393,7 @@ def run_agent(user_input: str, initial_task_memory: dict = None):
                     final_answer = fm
             break
 
+    # Fallback if there's no output_block
     if not output_block_triggered:
         last_sql_res = task_memory.get("last_sql_block_result", {})
         if "error" in last_sql_res:
@@ -854,6 +887,81 @@ def handle_batch_update_block(args: Dict[str, Any], task_memory: dict, debug_inf
         "explanation": explanation
     }
 
+def handle_batch_delete_block(args: Dict[str, Any], task_memory: dict, debug_info: list) -> dict:
+    """
+    Delete multiple rows in a table in one go.
+
+    Example JSON:
+    {
+      "table_name": "fridge_items",
+      "rows": [
+        { "where_clause": "WHERE id=7" },
+        { "where_clause": "WHERE name='spinach'" }
+      ],
+      "explanation": "Remove multiple items at once"
+    }
+    """
+    table_name = args.get("table_name", "").strip()
+    rows_info = args.get("rows", [])
+    explanation = args.get("explanation", "")
+
+    debug_info.append(f"[batch_delete_block] table={table_name}, #rows={len(rows_info)}")
+
+    from database import table_permissions
+    permission_mode = table_permissions.get(table_name, "ALWAYS_DENY")
+    user_permission = True  # e.g. some real check eventually
+
+    if permission_mode == "ALWAYS_DENY":
+        msg = f"[batch_delete_block] => table '{table_name}' => ALWAYS_DENY"
+        debug_info.append(msg)
+        logger.warning(msg)
+        return {"error": msg}
+
+    if permission_mode == "REQUIRE_USER" and not user_permission:
+        msg = f"[batch_delete_block] => not granted for '{table_name}'"
+        debug_info.append(msg)
+        logger.warning(msg)
+        return {"error": msg}
+
+    deleted_count = 0
+    error_msg = None
+    db = SessionLocal()
+
+    try:
+        for row_data in rows_info:
+            where_clause = row_data.get("where_clause", "").strip()
+            if not where_clause.upper().startswith("WHERE"):
+                raise ValueError(f"Missing or invalid where_clause => {where_clause}")
+
+            # Optionally convert to case-insensitive if needed
+            final_where = build_case_insensitive_where(where_clause)
+
+            sql_query = f"DELETE FROM {table_name} {final_where};"
+            debug_info.append(f"[batch_delete_block] running => {sql_query}")
+
+            result = db.execute(text(sql_query))
+            rowcount = result.rowcount or 0
+            deleted_count += rowcount
+
+        db.commit()
+    except Exception as e:
+        error_msg = str(e)
+        debug_info.append(f"[batch_delete_block] error => {error_msg}")
+        logger.warning(f"[batch_delete_block] error => {error_msg}")
+        db.rollback()
+    finally:
+        db.close()
+
+    if error_msg:
+        return {"error": error_msg, "rows_affected": deleted_count, "explanation": explanation}
+
+    # re-use "rows_affected" so output_block logic can handle it
+    return {
+        "success": True,
+        "rows_affected": deleted_count,
+        "explanation": explanation
+    }
+
 
 def handle_output_block(args: Dict[str, Any], task_memory: dict, debug_info: list) -> dict:
     llm_message = args.get("final_message", "").strip()
@@ -1136,6 +1244,58 @@ batch_update_block_schema = {
     }
 }
 
+class BatchDeleteRow(BaseModel):
+    where_clause: str  # e.g. "WHERE id=5" or "WHERE name='spinach'"
+
+class BatchDeleteBlockArguments(BaseModel):
+    table_name: str
+    rows: List[BatchDeleteRow]  # each row just has a where_clause
+    explanation: str = ""
+
+batch_delete_block_schema = {
+    "name": "batch_delete_block",
+    "description": (
+        "Delete multiple rows from one table in a single call. "
+        "If user says 'Remove these 5 items at once,' produce something like:\n"
+        "{\n"
+        '  "table_name": "fridge_items",\n'
+        '  "rows": [\n'
+        '     {"where_clause":"WHERE id=7"},\n'
+        '     {"where_clause":"WHERE name=\'spinach\'"}\n'
+        '   ],\n'
+        '  "explanation":"Deleting multiple items at once."\n'
+        '}'
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "table_name": {
+                "type": "string",
+                "description": "The DB table to delete from, e.g. 'fridge_items'"
+            },
+            "rows": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "where_clause": {
+                            "type": "string",
+                            "description": "WHERE clause, e.g. 'WHERE name=\\'spinach\\''"
+                        }
+                    },
+                    "required": ["where_clause"]
+                },
+                "description": "List of row-level deletes"
+            },
+            "explanation": {
+                "type": "string",
+                "description": "Reason or comment about these deletions"
+            }
+        },
+        "required": ["table_name","rows"],
+        "additionalProperties": False
+    }
+}
 
 ALL_FUNCTION_SCHEMAS = [
     plan_tasks_schema,
@@ -1143,115 +1303,180 @@ ALL_FUNCTION_SCHEMAS = [
     output_block_schema,
     parse_block_schema,
     batch_insert_block_schema,
-    batch_update_block_schema
+    batch_update_block_schema,
+    batch_delete_block_schema
 ]
 
 --- plan_prompt.md ---
-You are an AI Orchestrator. You must produce a short plan (a list of tasks) in JSON form, calling the `plan_tasks` function.
+You are an **AI Orchestrator**. Your job is to **produce exactly one JSON object** in the following shape:
 
-We have these blocks you can use:
-
-1) **sql_block**
-   - Purpose: Run an actual SQL query on the local database.
-   - You must produce JSON with `"table_name"`, `"columns"`, `"values"`, `"action_type"`, and `"explanation"`.
-   - **Important:** For `fridge_items`, the valid columns are exactly: `"name", "quantity", "unit", "expiration_date", "category"`.
-     No other columns like `"item_name"` or `"expiry_date"`.
-   - We can do `SELECT`, `INSERT`, `UPDATE`, or `DELETE`. 
-   - No disclaimers or code blocks—only function-calling with `"name": "sql_block"`.
-
-2) **output_block**
-   - Purpose: Provide the final user answer.
-
-3) **parse_block**
-   - Purpose: Parse or unify user text **and/or** data from the DB (if you have it) into structured form.
-   - No disclaimers—only function-calling with `"name": "parse_block"`.
-
-4) **batch_insert_block**
-   - Purpose: Insert multiple rows in a single call.
-   - If user says “Add these 5 items at once,” produce something like:
-     ```json
-     {
-       "name": "batch_insert_block",
-       "arguments": {
-         "table_name": "fridge_items",
-         "rows": [
-           { "columns":["name","quantity"], "values":["milk","2"] },
-           { "columns":["name","quantity"], "values":["eggs","12"] }
-         ],
-         "explanation": "User wants to add multiple items quickly"
-       }
-     }
-     ```
-   - No disclaimers.
-
-5) **batch_update_block** (NEW)
-   - Purpose: **Update multiple rows** in a single call.
-   - If user says “Update these 5 items at once,” produce e.g.:
-     ```json
-     {
-       "name": "batch_update_block",
-       "arguments": {
-         "table_name": "fridge_items",
-         "rows": [
-           {
-             "where_clause": "WHERE id=6",
-             "columns": ["quantity","expiration_date"],
-             "values": ["4","2025-07-01"]
-           },
-           {
-             "where_clause": "WHERE id=7",
-             "columns": ["quantity"],
-             "values": ["2"]
-           }
-         ],
-         "explanation": "User wants to do multiple updates quickly"
-       }
-     }
-     ```
-   - No disclaimers. Provide each row’s `where_clause` and updated columns/values.
-
-**Constraints**:
-- Return exactly **one** function call to `"plan_tasks"` with `"tasks": [...]`.
-- Each task is an object:
-  ```json
-  {
-    "block": "sql_block" | "batch_insert_block" | "batch_update_block" | "parse_block" | "output_block",
-    "description": "...",
-    "title": "...",
-    "reasoning": "..."
+```json
+{
+  "name": "plan_tasks",
+  "arguments": {
+    "tasks": [
+      {
+        "block": "...",
+        "description": "...",
+        "title": "...",
+        "reasoning": "..."
+      },
+      ...
+    ]
   }
-  At the final step, do NOT produce normal text—only output_block with {"final_message":"..."}.
-  Example advanced scenario:
-  {
+}
+No additional top-level JSON or text is allowed—only this single "plan_tasks" JSON object.
+
+Tasks Array
+Inside "arguments": { "tasks": [...] }, each element is a step with:
+{
+  "block": "<block_name>",
+  "description": "<short explanation>",
+  "title": "<short label>",
+  "reasoning": "<brief reasoning>"
+}
+The final item in "tasks" must be {"block":"output_block", ...} with a "final_message":"...".
+
+Blocks You Can Use:
+1) sql_block
+
+Purpose: Execute a single SQL query.
+Must produce "table_name", "columns", "values", "action_type", "explanation".
+Allowed action_type: "SELECT" | "INSERT" | "UPDATE" | "DELETE".
+For the table fridge_items, valid columns are exactly [ "name", "quantity", "unit", "expiration_date", "category" ].
+No disclaimers or code blocks; only JSON with "name":"sql_block".
+2) parse_block
+
+Purpose: Parse or unify user text and/or DB data into a more structured form.
+Important: This does not do database changes. It only prepares data for a later step.
+If the user’s request wants to physically change the DB, you must eventually produce sql_block or batch_update_block or batch_delete_block after parse_block. Don’t end on parse_block alone.
+3) batch_insert_block
+
+Purpose: Insert multiple rows in a single call.
+For example:
+{
+  "name": "batch_insert_block",
+  "arguments": {
+    "table_name": "fridge_items",
+    "rows": [
+      { "columns": ["name","quantity"], "values": ["milk","2"] },
+      { "columns": ["name","quantity"], "values": ["eggs","12"] }
+    ],
+    "explanation": "Multiple inserts"
+  }
+}
+
+4) batch_update_block
+
+Purpose: Update multiple rows in a single call.
+If the user wants to physically change existing rows, produce a batch_update_block with where_clause for each row, for example:
+{
+  "name": "batch_update_block",
+  "arguments": {
+    "table_name": "fridge_items",
+    "rows": [
+      {
+        "where_clause": "WHERE id=6",
+        "columns": ["quantity","expiration_date"],
+        "values": ["4","2025-07-01"]
+      },
+      {
+        "where_clause": "WHERE id=7",
+        "columns": ["quantity"],
+        "values": ["2"]
+      }
+    ],
+    "explanation": "Bulk update"
+  }
+}
+No disclaimers. Provide each row’s where_clause, columns, and values.
+
+5) batch_delete_block
+
+Purpose: Delete multiple rows in a single call.
+E.g.:
+{
+  "name": "batch_delete_block",
+  "arguments": {
+    "table_name": "fridge_items",
+    "rows": [
+      { "where_clause": "WHERE id=7" },
+      { "where_clause": "WHERE name='spinach'" }
+    ],
+    "explanation": "Deleting multiple items"
+  }
+}
+
+No disclaimers. Provide each row’s where_clause as needed.
+
+6) output_block
+
+Purpose: Provide the user-facing conclusion.
+Must have {"final_message":"some text"}.
+Always the final step in your "tasks" array.
+
+Key Constraints:
+Exactly one JSON object with "name":"plan_tasks" at top-level.
+Inside: "arguments":{ "tasks":[...] }.
+The final item in tasks must be {"block": "output_block", ...} with "final_message":"...".
+If user’s request implies physically changing or removing items in the DB, do not finish with parse_block alone. You must produce an actual write step:
+sql_block with "action_type":"UPDATE" or "action_type":"DELETE",
+or batch_update_block,
+or batch_delete_block.
+Then finalize with output_block.
+
+Remember:
+parse_block is purely for reformatting or clarifying data. It does no actual database changes.
+For changes, you need a sql_block or batch_..._block.
+
+Available Table Names:
+fridge_items
+shopping_items
+invoices
+invoice_items
+monthly_spendings
+
+Example of a Multi-Step Plan:
+{
   "name": "plan_tasks",
   "arguments": {
     "tasks": [
       {
         "block": "sql_block",
-        "description": "Select from fridge_items to get current data",
-        "title": "Select Fridge",
+        "description": "Select from fridge_items",
+        "title": "Query fridge",
         "reasoning": "We need existing rows"
       },
       {
         "block": "parse_block",
-        "description": "Parse or unify the DB rows to fill missing columns",
-        "title": "Parse DB rows",
-        "reasoning": "User wants to fill missing data"
+        "description": "Analyze retrieved data to find missing columns",
+        "title": "Parse for missing data",
+        "reasoning": "We unify or fill columns in memory"
       },
       {
         "block": "batch_update_block",
-        "description": "Update multiple rows at once",
-        "title": "Batch Update",
-        "reasoning": "Apply the parsed data to the DB"
+        "description": "Fix missing columns in fridge_items",
+        "title": "Batch update fridge",
+        "reasoning": "Apply the changes we decided on"
       },
       {
         "block": "output_block",
-        "description": "Return final answer",
-        "title": "Show final answer",
-        "reasoning": "We produce final text"
+        "description": "Final user answer",
+        "title": "Show result",
+        "reasoning": "We provide final user-facing text"
       }
     ]
   }
 }
-No disclaimers. Just that function call in valid JSON.
-At the final step, always call output_block with a short user-facing message summarizing the results—no exceptions.
+
+(Where the final item is an output_block with "final_message":"...".)
+
+No disclaimers, no extra JSON at the top level. Just the single {"name":"plan_tasks","arguments":{...}}.
+
+That’s it—no other text.
+
+### Additional Nudges
+
+- If the user says “clean up / sanitize / fix duplicates / fill missing columns,” that implies a real DB **update** or **delete** step. So your plan must contain a `batch_update_block` or `batch_delete_block` or a `sql_block` with `"action_type":"UPDATE"`/`"DELETE"`.  
+- Do **not** finalize with parse_block alone. The parse_block is only a “prep” step.  
+- Always produce an **output_block** at the end with `"final_message":"some short user-facing text"`.  
