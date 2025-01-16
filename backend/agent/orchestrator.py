@@ -13,11 +13,13 @@ from .blocks import (
     handle_sql_block,
     handle_output_block,
     handle_batch_insert_block,
-    handle_batch_update_block  # <-- NEW: import the new batch_update handler
+    handle_batch_update_block,
+    handle_batch_delete_block,  # <-- also import the new delete handler
 )
 from agent.global_store import TABLE_SCHEMAS, CURRENT_DATETIME_FN
 
 logger = logging.getLogger("agent")
+
 
 def call_openai_plan(user_request: str, debug_info: list, task_memory: dict) -> PlanTasksArguments:
     """
@@ -86,8 +88,8 @@ def call_openai_plan(user_request: str, debug_info: list, task_memory: dict) -> 
 def build_system_prompt_for_block(block_name: str, block_description: str, task_memory: dict) -> str:
     """
     Provide specialized instructions for each block.
-    Now we also handle 'batch_insert_block' and 'batch_update_block' with short schema notes.
-    And mention parse_block can parse DB rows if needed.
+    Now also handle batch_insert_block, batch_update_block, and batch_delete_block
+    with short schema notes. And mention parse_block can parse DB rows if needed.
     """
     from agent.global_store import TABLE_SCHEMAS, CURRENT_DATETIME_FN
 
@@ -175,7 +177,7 @@ def build_system_prompt_for_block(block_name: str, block_description: str, task_
             + json.dumps(task_memory, default=str)
         )
 
-    elif block_name == "batch_update_block":  # <--- NEW
+    elif block_name == "batch_update_block":
         db_schema_str = (
             "Here is your DB schema:\n"
             "- fridge_items:\n"
@@ -192,6 +194,30 @@ def build_system_prompt_for_block(block_name: str, block_description: str, task_
         return (
             "You are 'batch_update_block'. You receive { table_name, rows:[{where_clause, columns, values},...], explanation}.\n"
             "Update multiple rows in a single call. If user says 'Update these items at once,' produce multiple row objects.\n\n"
+            + db_schema_str
+            + "\n"
+            + "task_memory => "
+            + json.dumps(task_memory, default=str)
+        )
+
+    elif block_name == "batch_delete_block":  # <--- NEW
+        db_schema_str = (
+            "Here is your DB schema:\n"
+            "- fridge_items:\n"
+            "   columns => [id, name, quantity, unit, expiration_date, category] (ALWAYS_ALLOW)\n"
+            "- shopping_items:\n"
+            "   columns => [id, name, desired_quantity, unit, purchased] (ALWAYS_ALLOW)\n"
+            "- invoices:\n"
+            "   columns => [id, date, total_amount, store_name] (REQUIRE_USER)\n"
+            "- invoice_items:\n"
+            "   columns => [id, invoice_id, name, quantity, price_per_unit] (REQUIRE_USER)\n"
+            "- monthly_spendings:\n"
+            "   columns => [id, year_month, total_spent] (ALWAYS_DENY)\n"
+        )
+        return (
+            "You are 'batch_delete_block'. You receive { table_name, rows:[{where_clause}], explanation}.\n"
+            "Delete multiple rows in a single call. If user says 'Remove these items at once,' produce multiple row objects.\n"
+            "Each object must have 'where_clause', e.g. WHERE id=7 or WHERE name='spinach'.\n\n"
             + db_schema_str
             + "\n"
             + "task_memory => "
@@ -273,8 +299,9 @@ def dispatch_block(block_name: str, args_data: dict, task_memory: dict, debug_in
     logger.info(f"[dispatch_block] block={block_name}, args={args_data}")
     debug_info.append(f"[dispatch_block] block={block_name}, args={args_data}")
 
+    # If the block is a DB-related batch or single SQL, set target_table from the arguments
     if ("table_name" in args_data
-        and block_name in ["sql_block","batch_insert_block","batch_update_block"]):
+        and block_name in ["sql_block","batch_insert_block","batch_update_block","batch_delete_block"]):
         guessed_table = args_data["table_name"]
         debug_info.append(f"[dispatch_block] Setting target_table => {guessed_table}")
         task_memory["target_table"] = guessed_table
@@ -284,7 +311,8 @@ def dispatch_block(block_name: str, args_data: dict, task_memory: dict, debug_in
         handle_sql_block,
         handle_output_block,
         handle_batch_insert_block,
-        handle_batch_update_block  # <-- NEW
+        handle_batch_update_block,
+        handle_batch_delete_block,
     )
 
     if block_name == "parse_block":
@@ -295,8 +323,10 @@ def dispatch_block(block_name: str, args_data: dict, task_memory: dict, debug_in
         return handle_output_block(args_data, task_memory, debug_info)
     elif block_name == "batch_insert_block":
         return handle_batch_insert_block(args_data, task_memory, debug_info)
-    elif block_name == "batch_update_block":  # <-- NEW
+    elif block_name == "batch_update_block":
         return handle_batch_update_block(args_data, task_memory, debug_info)
+    elif block_name == "batch_delete_block":  # <-- NEW
+        return handle_batch_delete_block(args_data, task_memory, debug_info)
     else:
         msg = f"Unrecognized block => {block_name}"
         debug_info.append(msg)
@@ -320,11 +350,12 @@ def run_agent(user_input: str, initial_task_memory: dict = None):
     final_answer = "(No final answer produced)"
     output_block_triggered = False
 
+    # Execute each step in the plan
     for step in plan_result.tasks:
         block = step.block
         desc = step.description
 
-        # optional heuristic for target_table
+        # (Optional) guess table from step description, e.g. if it mentions "fridge_items"
         if "fridge_items" in desc.lower():
             task_memory["target_table"] = "fridge_items"
         elif "shopping_list" in desc.lower() or "shopping_items" in desc.lower():
@@ -337,6 +368,7 @@ def run_agent(user_input: str, initial_task_memory: dict = None):
 
         if block == "output_block":
             output_block_triggered = True
+            # The output_block should produce either "final_answer" or "final_message"
             if "final_answer" in result:
                 final_answer = result["final_answer"]
             else:
@@ -345,6 +377,7 @@ def run_agent(user_input: str, initial_task_memory: dict = None):
                     final_answer = fm
             break
 
+    # Fallback if there's no output_block
     if not output_block_triggered:
         last_sql_res = task_memory.get("last_sql_block_result", {})
         if "error" in last_sql_res:

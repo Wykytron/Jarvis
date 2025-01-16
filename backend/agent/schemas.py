@@ -229,6 +229,58 @@ batch_update_block_schema = {
     }
 }
 
+class BatchDeleteRow(BaseModel):
+    where_clause: str  # e.g. "WHERE id=5" or "WHERE name='spinach'"
+
+class BatchDeleteBlockArguments(BaseModel):
+    table_name: str
+    rows: List[BatchDeleteRow]  # each row just has a where_clause
+    explanation: str = ""
+
+batch_delete_block_schema = {
+    "name": "batch_delete_block",
+    "description": (
+        "Delete multiple rows from one table in a single call. "
+        "If user says 'Remove these 5 items at once,' produce something like:\n"
+        "{\n"
+        '  "table_name": "fridge_items",\n'
+        '  "rows": [\n'
+        '     {"where_clause":"WHERE id=7"},\n'
+        '     {"where_clause":"WHERE name=\'spinach\'"}\n'
+        '   ],\n'
+        '  "explanation":"Deleting multiple items at once."\n'
+        '}'
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "table_name": {
+                "type": "string",
+                "description": "The DB table to delete from, e.g. 'fridge_items'"
+            },
+            "rows": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "where_clause": {
+                            "type": "string",
+                            "description": "WHERE clause, e.g. 'WHERE name=\\'spinach\\''"
+                        }
+                    },
+                    "required": ["where_clause"]
+                },
+                "description": "List of row-level deletes"
+            },
+            "explanation": {
+                "type": "string",
+                "description": "Reason or comment about these deletions"
+            }
+        },
+        "required": ["table_name","rows"],
+        "additionalProperties": False
+    }
+}
 
 ALL_FUNCTION_SCHEMAS = [
     plan_tasks_schema,
@@ -236,5 +288,6 @@ ALL_FUNCTION_SCHEMAS = [
     output_block_schema,
     parse_block_schema,
     batch_insert_block_schema,
-    batch_update_block_schema
+    batch_update_block_schema,
+    batch_delete_block_schema
 ]

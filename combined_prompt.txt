@@ -28,17 +28,16 @@ from .blocks import (
     handle_parse_block,
     handle_sql_block,
     handle_output_block,
-    handle_batch_insert_block
+    handle_batch_insert_block,
+    handle_batch_update_block  # <-- NEW: import the new batch_update handler
 )
 from agent.global_store import TABLE_SCHEMAS, CURRENT_DATETIME_FN
 
 logger = logging.getLogger("agent")
 
-
 def call_openai_plan(user_request: str, debug_info: list, task_memory: dict) -> PlanTasksArguments:
     """
     Calls GPT with plan instructions to produce a short JSON plan { tasks: [...] }.
-    This is still the same approach, but we might add a usage example to plan_prompt.
     """
     base_dir = os.path.dirname(os.path.abspath(__file__))
     plan_path = os.path.join(base_dir, "prompts", "plan_prompt.md")
@@ -103,8 +102,8 @@ def call_openai_plan(user_request: str, debug_info: list, task_memory: dict) -> 
 def build_system_prompt_for_block(block_name: str, block_description: str, task_memory: dict) -> str:
     """
     Provide specialized instructions for each block.
-    Now we also handle 'batch_insert_block' with a short schema note.
-    And we add a mention that parse_block can parse DB rows.
+    Now we also handle 'batch_insert_block' and 'batch_update_block' with short schema notes.
+    And mention parse_block can parse DB rows if needed.
     """
     from agent.global_store import TABLE_SCHEMAS, CURRENT_DATETIME_FN
 
@@ -119,14 +118,11 @@ def build_system_prompt_for_block(block_name: str, block_description: str, task_
         table_cols = TABLE_SCHEMAS.get(target_table, [])
         col_list_str = ", ".join(table_cols)
 
-        # If we have last_sql_rows in memory, we can mention it to the LLM
         last_rows = task_memory.get("last_sql_rows", [])
-        # We'll just embed them in the system prompt:
         last_rows_str = json.dumps(last_rows, default=str)
 
         return (
             "You are the 'parse_block'. You can parse or unify user text AND/OR data from the DB.\n"
-            "Sometimes we do: 1) SELECT from DB => we get db_rows => then parse them to fill missing columns.\n"
             "If 'db_rows' is provided, unify or fill columns. If user says '1 liter', parse quantity=1.0, unit='liter'.\n"
             "If user says 'expires next week', convert to a date offset.\n"
             "Return function_call => { raw_text:'...', explanation:'...', db_rows:..., parsed_item:{...} }.\n\n"
@@ -154,10 +150,9 @@ def build_system_prompt_for_block(block_name: str, block_description: str, task_
         )
         return (
             "You are 'sql_block'. You produce JSON => { table_name, columns, values, action_type, explanation, [where_clause] }.\n"
-            "No disclaimers. If user says 'delete X', do DELETE with a proper where_clause.\n"
+            "If user says 'delete X', do DELETE with a proper where_clause.\n"
             "If user says 'update X', do UPDATE with a proper where_clause.\n"
-            "You MUST always provide a where_clause if action_type=DELETE or UPDATE.\n"
-            "If user wants to fill missing columns after parse_block, incorporate them.\n\n"
+            "You MUST always provide a where_clause if action_type=DELETE or UPDATE.\n\n"
             + db_schema_str
             + "\n"
             + "task_memory => "
@@ -189,7 +184,30 @@ def build_system_prompt_for_block(block_name: str, block_description: str, task_
         )
         return (
             "You are 'batch_insert_block'. You receive { table_name, rows:[{columns, values},...], explanation}.\n"
-            "No disclaimers. Insert multiple rows into the DB.\n\n"
+            "Insert multiple rows into the DB.\n\n"
+            + db_schema_str
+            + "\n"
+            + "task_memory => "
+            + json.dumps(task_memory, default=str)
+        )
+
+    elif block_name == "batch_update_block":  # <--- NEW
+        db_schema_str = (
+            "Here is your DB schema:\n"
+            "- fridge_items:\n"
+            "   columns => [id, name, quantity, unit, expiration_date, category] (ALWAYS_ALLOW)\n"
+            "- shopping_items:\n"
+            "   columns => [id, name, desired_quantity, unit, purchased] (ALWAYS_ALLOW)\n"
+            "- invoices:\n"
+            "   columns => [id, date, total_amount, store_name] (REQUIRE_USER)\n"
+            "- invoice_items:\n"
+            "   columns => [id, invoice_id, name, quantity, price_per_unit] (REQUIRE_USER)\n"
+            "- monthly_spendings:\n"
+            "   columns => [id, year_month, total_spent] (ALWAYS_DENY)\n"
+        )
+        return (
+            "You are 'batch_update_block'. You receive { table_name, rows:[{where_clause, columns, values},...], explanation}.\n"
+            "Update multiple rows in a single call. If user says 'Update these items at once,' produce multiple row objects.\n\n"
             + db_schema_str
             + "\n"
             + "task_memory => "
@@ -240,7 +258,6 @@ def call_block_llm(block_name: str, block_description: str, task_memory: dict, d
     choice = resp.choices[0]
     fn_call = choice.message.function_call
     if not fn_call:
-        # fallback parse
         content_str = choice.message.content or ""
         debug_info.append(f"[block_llm] no function_call => fallback parse content = {content_str}")
         try:
@@ -273,7 +290,7 @@ def dispatch_block(block_name: str, args_data: dict, task_memory: dict, debug_in
     debug_info.append(f"[dispatch_block] block={block_name}, args={args_data}")
 
     if ("table_name" in args_data
-        and block_name in ["sql_block","batch_insert_block"]):
+        and block_name in ["sql_block","batch_insert_block","batch_update_block"]):
         guessed_table = args_data["table_name"]
         debug_info.append(f"[dispatch_block] Setting target_table => {guessed_table}")
         task_memory["target_table"] = guessed_table
@@ -282,7 +299,8 @@ def dispatch_block(block_name: str, args_data: dict, task_memory: dict, debug_in
         handle_parse_block,
         handle_sql_block,
         handle_output_block,
-        handle_batch_insert_block
+        handle_batch_insert_block,
+        handle_batch_update_block  # <-- NEW
     )
 
     if block_name == "parse_block":
@@ -293,6 +311,8 @@ def dispatch_block(block_name: str, args_data: dict, task_memory: dict, debug_in
         return handle_output_block(args_data, task_memory, debug_info)
     elif block_name == "batch_insert_block":
         return handle_batch_insert_block(args_data, task_memory, debug_info)
+    elif block_name == "batch_update_block":  # <-- NEW
+        return handle_batch_update_block(args_data, task_memory, debug_info)
     else:
         msg = f"Unrecognized block => {block_name}"
         debug_info.append(msg)
@@ -303,7 +323,6 @@ def dispatch_block(block_name: str, args_data: dict, task_memory: dict, debug_in
 def run_agent(user_input: str, initial_task_memory: dict = None):
     """
     Orchestrates the user request -> plan -> block calls -> final answer.
-    If no output_block triggered, we produce a fallback answer (SELECT results, rowcount, etc).
     """
     debug_info = []
     if not initial_task_memory:
@@ -321,7 +340,7 @@ def run_agent(user_input: str, initial_task_memory: dict = None):
         block = step.block
         desc = step.description
 
-        # optional heuristic to guess table from desc
+        # optional heuristic for target_table
         if "fridge_items" in desc.lower():
             task_memory["target_table"] = "fridge_items"
         elif "shopping_list" in desc.lower() or "shopping_items" in desc.lower():
@@ -512,9 +531,16 @@ def build_case_insensitive_where(where_str: str) -> str:
     return out
 
 def quote_if_needed(val: str) -> str:
+    # If val is None, treat it as "NULL" in SQL
+    if val is None:
+        return "NULL"
+
+    # else proceed
     trimmed = val.strip()
+    # if numeric or already single-quoted => return as is
     if (trimmed.startswith("'") and trimmed.endswith("'")) or trimmed.replace(".", "", 1).isdigit():
         return trimmed
+
     return f"'{trimmed}'"
 
 
@@ -745,6 +771,89 @@ def handle_batch_insert_block(args: Dict[str, Any], task_memory: dict, debug_inf
         "explanation": explanation
     }
 
+def handle_batch_update_block(args: Dict[str, Any], task_memory: dict, debug_info: list) -> dict:
+    """
+    Similar to batch_insert_block, but for multiple UPDATE statements in one call.
+
+    {
+      "table_name": "fridge_items",
+      "rows": [
+        {
+          "where_clause": "WHERE id=5",
+          "columns": ["quantity","expiration_date"],
+          "values": ["3","2025-05-10"]
+        },
+        ...
+      ],
+      "explanation": "some reason"
+    }
+    """
+    table_name = args.get("table_name","").strip()
+    rows_info = args.get("rows", [])
+    explanation = args.get("explanation","")
+
+    debug_info.append(f"[batch_update] table={table_name}, #rows={len(rows_info)}")
+
+    permission_mode = table_permissions.get(table_name, "ALWAYS_DENY")
+    user_permission = True  # or some real check
+
+    if permission_mode == "ALWAYS_DENY":
+        msg = f"[batch_update_block] => table '{table_name}' => ALWAYS_DENY"
+        debug_info.append(msg)
+        logger.warning(msg)
+        return {"error": msg}
+
+    if permission_mode == "REQUIRE_USER" and not user_permission:
+        msg = f"[batch_update_block] => not granted for '{table_name}'"
+        debug_info.append(msg)
+        logger.warning(msg)
+        return {"error": msg}
+
+    updated_count = 0
+    error_msg = None
+    db = SessionLocal()
+    try:
+        for row_data in rows_info:
+            where_clause = row_data.get("where_clause","").strip()
+            columns = row_data.get("columns", [])
+            values = row_data.get("values", [])
+
+            if not where_clause.upper().startswith("WHERE"):
+                raise ValueError(f"Missing or invalid where_clause => {where_clause}")
+
+            if len(columns) != len(values):
+                raise ValueError(f"Mismatch => columns={columns}, values={values}")
+
+            set_clauses = []
+            for c, v in zip(columns, values):
+                set_clauses.append(f"{c}={quote_if_needed(v)}")
+            set_stmt = ", ".join(set_clauses)
+
+            sql_query = f"UPDATE {table_name} SET {set_stmt} {where_clause};"
+            debug_info.append(f"[batch_update] running => {sql_query}")
+
+            result = db.execute(text(sql_query))
+            rowcount = result.rowcount or 0
+            updated_count += rowcount
+
+        db.commit()
+    except Exception as e:
+        error_msg = str(e)
+        debug_info.append(f"[batch_update_block] error => {error_msg}")
+        logger.warning(f"[batch_update_block] error => {error_msg}")
+        db.rollback()
+    finally:
+        db.close()
+
+    if error_msg:
+        return {"error": error_msg, "rows_affected": updated_count, "explanation": explanation}
+
+    return {
+        "success": True,
+        "rows_affected": updated_count,
+        "explanation": explanation
+    }
+
 
 def handle_output_block(args: Dict[str, Any], task_memory: dict, debug_info: list) -> dict:
     llm_message = args.get("final_message", "").strip()
@@ -972,12 +1081,69 @@ batch_insert_block_schema = {
     }
 }
 
+class BatchUpdateRow(BaseModel):
+    where_clause: str            # e.g. "WHERE id=6"
+    columns: List[str]
+    values: List[str]
+
+class BatchUpdateBlockArguments(BaseModel):
+    table_name: str
+    rows: List[BatchUpdateRow]
+    explanation: str = ""
+
+batch_update_block_schema = {
+    "name": "batch_update_block",
+    "description": (
+        "Update multiple rows in one table in a single call. "
+        "If user says 'Update multiple fridge items at once', produce an array of row updates."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "table_name": {
+                "type": "string",
+                "description": "e.g. 'fridge_items'"
+            },
+            "rows": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "where_clause": {
+                            "type": "string",
+                            "description": "WHERE clause, e.g. 'WHERE id=7'"
+                        },
+                        "columns": {
+                            "type": "array",
+                            "items": {"type": "string"}
+                        },
+                        "values": {
+                            "type": "array",
+                            "items": {"type": "string"}
+                        }
+                    },
+                    "required": ["where_clause","columns","values"]
+                },
+                "description": "List of row-level updates"
+            },
+            "explanation": {
+                "type": "string",
+                "description": "Reasoning or comment about these updates"
+            }
+        },
+        "required": ["table_name","rows"],
+        "additionalProperties": False
+    }
+}
+
+
 ALL_FUNCTION_SCHEMAS = [
     plan_tasks_schema,
     sql_block_schema,
     output_block_schema,
     parse_block_schema,
-    batch_insert_block_schema
+    batch_insert_block_schema,
+    batch_update_block_schema
 ]
 
 --- plan_prompt.md ---
@@ -1000,38 +1166,63 @@ We have these blocks you can use:
    - Purpose: Parse or unify user text **and/or** data from the DB (if you have it) into structured form.
    - No disclaimers—only function-calling with `"name": "parse_block"`.
 
-4) **batch_insert_block** (NEW)
-   - Purpose: Insert multiple rows in a single call. 
+4) **batch_insert_block**
+   - Purpose: Insert multiple rows in a single call.
    - If user says “Add these 5 items at once,” produce something like:
      ```json
      {
        "name": "batch_insert_block",
        "arguments": {
-         "table_name":"fridge_items",
+         "table_name": "fridge_items",
          "rows": [
            { "columns":["name","quantity"], "values":["milk","2"] },
            { "columns":["name","quantity"], "values":["eggs","12"] }
          ],
-         "explanation":"User wants to add multiple items quickly"
+         "explanation": "User wants to add multiple items quickly"
        }
      }
      ```
    - No disclaimers.
 
+5) **batch_update_block** (NEW)
+   - Purpose: **Update multiple rows** in a single call.
+   - If user says “Update these 5 items at once,” produce e.g.:
+     ```json
+     {
+       "name": "batch_update_block",
+       "arguments": {
+         "table_name": "fridge_items",
+         "rows": [
+           {
+             "where_clause": "WHERE id=6",
+             "columns": ["quantity","expiration_date"],
+             "values": ["4","2025-07-01"]
+           },
+           {
+             "where_clause": "WHERE id=7",
+             "columns": ["quantity"],
+             "values": ["2"]
+           }
+         ],
+         "explanation": "User wants to do multiple updates quickly"
+       }
+     }
+     ```
+   - No disclaimers. Provide each row’s `where_clause` and updated columns/values.
+
 **Constraints**:
 - Return exactly **one** function call to `"plan_tasks"` with `"tasks": [...]`.
-- Each task is an object: 
+- Each task is an object:
   ```json
   {
-    "block": "sql_block" | "parse_block" | "output_block" | "batch_insert_block",
+    "block": "sql_block" | "batch_insert_block" | "batch_update_block" | "parse_block" | "output_block",
     "description": "...",
     "title": "...",
     "reasoning": "..."
   }
-  - No extra text. At the final step, do NOT produce normal text—only output_block with {"final_message":"..."}.
-Example of a more advanced scenario:
-If user wants: “Retrieve fridge content, parse it, then update missing columns,” produce tasks like:
-{
+  At the final step, do NOT produce normal text—only output_block with {"final_message":"..."}.
+  Example advanced scenario:
+  {
   "name": "plan_tasks",
   "arguments": {
     "tasks": [
@@ -1048,10 +1239,10 @@ If user wants: “Retrieve fridge content, parse it, then update missing columns
         "reasoning": "User wants to fill missing data"
       },
       {
-        "block": "sql_block",
-        "description": "Update fridge with the newly filled columns",
-        "title": "Update fridge",
-        "reasoning": "We apply the parsed data to the DB"
+        "block": "batch_update_block",
+        "description": "Update multiple rows at once",
+        "title": "Batch Update",
+        "reasoning": "Apply the parsed data to the DB"
       },
       {
         "block": "output_block",
@@ -1063,3 +1254,4 @@ If user wants: “Retrieve fridge content, parse it, then update missing columns
   }
 }
 No disclaimers. Just that function call in valid JSON.
+At the final step, always call output_block with a short user-facing message summarizing the results—no exceptions.

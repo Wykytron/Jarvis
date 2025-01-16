@@ -138,9 +138,16 @@ def build_case_insensitive_where(where_str: str) -> str:
     return out
 
 def quote_if_needed(val: str) -> str:
+    # If val is None, treat it as "NULL" in SQL
+    if val is None:
+        return "NULL"
+
+    # else proceed
     trimmed = val.strip()
+    # if numeric or already single-quoted => return as is
     if (trimmed.startswith("'") and trimmed.endswith("'")) or trimmed.replace(".", "", 1).isdigit():
         return trimmed
+
     return f"'{trimmed}'"
 
 
@@ -451,6 +458,81 @@ def handle_batch_update_block(args: Dict[str, Any], task_memory: dict, debug_inf
     return {
         "success": True,
         "rows_affected": updated_count,
+        "explanation": explanation
+    }
+
+def handle_batch_delete_block(args: Dict[str, Any], task_memory: dict, debug_info: list) -> dict:
+    """
+    Delete multiple rows in a table in one go.
+
+    Example JSON:
+    {
+      "table_name": "fridge_items",
+      "rows": [
+        { "where_clause": "WHERE id=7" },
+        { "where_clause": "WHERE name='spinach'" }
+      ],
+      "explanation": "Remove multiple items at once"
+    }
+    """
+    table_name = args.get("table_name", "").strip()
+    rows_info = args.get("rows", [])
+    explanation = args.get("explanation", "")
+
+    debug_info.append(f"[batch_delete_block] table={table_name}, #rows={len(rows_info)}")
+
+    from database import table_permissions
+    permission_mode = table_permissions.get(table_name, "ALWAYS_DENY")
+    user_permission = True  # e.g. some real check eventually
+
+    if permission_mode == "ALWAYS_DENY":
+        msg = f"[batch_delete_block] => table '{table_name}' => ALWAYS_DENY"
+        debug_info.append(msg)
+        logger.warning(msg)
+        return {"error": msg}
+
+    if permission_mode == "REQUIRE_USER" and not user_permission:
+        msg = f"[batch_delete_block] => not granted for '{table_name}'"
+        debug_info.append(msg)
+        logger.warning(msg)
+        return {"error": msg}
+
+    deleted_count = 0
+    error_msg = None
+    db = SessionLocal()
+
+    try:
+        for row_data in rows_info:
+            where_clause = row_data.get("where_clause", "").strip()
+            if not where_clause.upper().startswith("WHERE"):
+                raise ValueError(f"Missing or invalid where_clause => {where_clause}")
+
+            # Optionally convert to case-insensitive if needed
+            final_where = build_case_insensitive_where(where_clause)
+
+            sql_query = f"DELETE FROM {table_name} {final_where};"
+            debug_info.append(f"[batch_delete_block] running => {sql_query}")
+
+            result = db.execute(text(sql_query))
+            rowcount = result.rowcount or 0
+            deleted_count += rowcount
+
+        db.commit()
+    except Exception as e:
+        error_msg = str(e)
+        debug_info.append(f"[batch_delete_block] error => {error_msg}")
+        logger.warning(f"[batch_delete_block] error => {error_msg}")
+        db.rollback()
+    finally:
+        db.close()
+
+    if error_msg:
+        return {"error": error_msg, "rows_affected": deleted_count, "explanation": explanation}
+
+    # re-use "rows_affected" so output_block logic can handle it
+    return {
+        "success": True,
+        "rows_affected": deleted_count,
         "explanation": explanation
     }
 
