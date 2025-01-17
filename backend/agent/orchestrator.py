@@ -137,7 +137,7 @@ def build_system_prompt_for_block(block_name: str, block_description: str, task_
             "You are 'parse_block'. You parse user text for item info, date phrases, etc.\n"
             "You can consider 'original_user_input' if no raw_text or db_rows is provided.\n"
             "Your goal is to fill potential missing info from the user request or db_rows and fill the parsed_item with all the info you can, see the database schema for reference.\n"
-            "User might say "Add Milk to fridge", then you should look into the db schema and fill all missing columns with reasonable informations and format everything nicely into parsed_item.\n"
+            "User might say 'Add Milk to fridge', then you should look into the db schema and fill all missing columns with reasonable informations and format everything nicely into parsed_item.\n"
             "Then return JSON => {parsed_item, explanation}.\n"
             f"{dynamic_schema_str}\n"
             "Minimal parse inputs => " + json.dumps(subset, default=str)
@@ -181,6 +181,7 @@ def build_system_prompt_for_block(block_name: str, block_description: str, task_
         # Possibly user wants open-ended reasoning about the data
         return (
             "You are 'chat_block'. Perform open-ended conversation or reasoning.\n"
+            "Use all of the data in task_memory to answer the user's question.\n"
             "Return JSON => {response_text}.\n\n"
             + "\nYou receive full task_memory => " + json.dumps(task_memory, default=str)
         )

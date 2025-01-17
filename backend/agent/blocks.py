@@ -536,7 +536,7 @@ def handle_output_block(args: Dict[str, Any], task_memory: dict, debug_info: lis
     if not llm_message:
         llm_message = "(No final_message provided)"
 
-    recent_sql = task_memory.get("recent_sql_result", {})
+    recent_sql = task_memory.get("recent_sql_result") or {}
     sql_error = recent_sql.get("error", "")
     row_affected = recent_sql.get("rows_affected", None)
     row_count = recent_sql.get("rows_count", None)
