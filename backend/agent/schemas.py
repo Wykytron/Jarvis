@@ -1,4 +1,4 @@
-# backend/agent/schemas.py
+# v0.2/backend/agent/schemas.py
 
 from typing import List, Optional, Literal, Any
 from pydantic import BaseModel
@@ -24,16 +24,17 @@ plan_tasks_schema = {
     "parameters": PlanTasksArguments.schema()
 }
 
+
 #
 # 2) sql_block
 #
 class SQLBlockArguments(BaseModel):
     table_name: str
     columns: List[str]  # e.g. ["name","quantity","unit","expiration_date","category"]
-    values: List[str]   # e.g. ["'Joghurt'","2","'unit'","'2025-01-25'","'dairy'"]
+    values: List[str]   # e.g. ["Joghurt","2","unit","2025-01-25","dairy"]
     action_type: Literal["SELECT", "INSERT", "UPDATE", "DELETE"]
     explanation: str = ""
-    where_clause: Optional[str] = None  # for updates/deletes
+    where_clause: Optional[str] = None
 
 sql_block_schema = {
     "name": "sql_block",
@@ -59,15 +60,13 @@ sql_block_schema = {
                 "enum": ["SELECT","INSERT","UPDATE","DELETE"]
             },
             "explanation": {"type": "string"},
-            "where_clause": {
-                "type": "string",
-                "description": "e.g. WHERE name='tomatoes'"
-            }
+            "where_clause": {"type": "string"}
         },
         "required": ["table_name","columns","values","action_type"],
         "additionalProperties": False
     }
 }
+
 
 #
 # 3) output_block
@@ -82,14 +81,14 @@ output_block_schema = {
         "type": "object",
         "properties": {
             "final_message": {
-                "type": "string",
-                "description": "User-facing text or summary"
+                "type": "string"
             }
         },
         "required": ["final_message"],
         "additionalProperties": False
     }
 }
+
 
 #
 # 4) parse_block
@@ -98,7 +97,6 @@ class ParseBlockArguments(BaseModel):
     raw_text: str
     explanation: Optional[str] = ""
     parsed_item: Optional[Any] = None
-    # NEW: allow the LLM to pass db_rows if it wants
     db_rows: Optional[List[Any]] = None
 
 parse_block_schema = {
@@ -118,14 +116,14 @@ parse_block_schema = {
             },
             "db_rows": {
                 "type": "array",
-                "items": {"type": "object"},
-                "description": "If we need to parse/fill data from a prior SELECT query"
+                "items": {"type": "object"}
             }
         },
         "required": ["raw_text"],
         "additionalProperties": False
     }
 }
+
 
 #
 # 5) batch_insert_block
@@ -142,9 +140,8 @@ class BatchInsertBlockArguments(BaseModel):
 batch_insert_block_schema = {
     "name": "batch_insert_block",
     "description": (
-        "Insert multiple rows into one table in a single call. "
-        "No disclaimers, only valid JSON. "
-        "If user says 'Add multiple items at once', produce an array of {columns, values}."
+        "Insert multiple rows in one table in a single call."
+        "No disclaimers, only valid JSON."
     ),
     "parameters": {
         "type": "object",
@@ -174,8 +171,12 @@ batch_insert_block_schema = {
     }
 }
 
+
+#
+# 6) batch_update_block
+#
 class BatchUpdateRow(BaseModel):
-    where_clause: str            # e.g. "WHERE id=6"
+    where_clause: str
     columns: List[str]
     values: List[str]
 
@@ -187,25 +188,18 @@ class BatchUpdateBlockArguments(BaseModel):
 batch_update_block_schema = {
     "name": "batch_update_block",
     "description": (
-        "Update multiple rows in one table in a single call. "
-        "If user says 'Update multiple fridge items at once', produce an array of row updates."
+        "Update multiple rows in one table in a single call."
     ),
     "parameters": {
         "type": "object",
         "properties": {
-            "table_name": {
-                "type": "string",
-                "description": "e.g. 'fridge_items'"
-            },
+            "table_name": {"type": "string"},
             "rows": {
                 "type": "array",
                 "items": {
                     "type": "object",
                     "properties": {
-                        "where_clause": {
-                            "type": "string",
-                            "description": "WHERE clause, e.g. 'WHERE id=7'"
-                        },
+                        "where_clause": {"type": "string"},
                         "columns": {
                             "type": "array",
                             "items": {"type": "string"}
@@ -216,99 +210,79 @@ batch_update_block_schema = {
                         }
                     },
                     "required": ["where_clause","columns","values"]
-                },
-                "description": "List of row-level updates"
+                }
             },
-            "explanation": {
-                "type": "string",
-                "description": "Reasoning or comment about these updates"
-            }
+            "explanation": {"type": "string"}
         },
         "required": ["table_name","rows"],
         "additionalProperties": False
     }
 }
 
+
+#
+# 7) batch_delete_block
+#
 class BatchDeleteRow(BaseModel):
-    where_clause: str  # e.g. "WHERE id=5" or "WHERE name='spinach'"
+    where_clause: str
 
 class BatchDeleteBlockArguments(BaseModel):
     table_name: str
-    rows: List[BatchDeleteRow]  # each row just has a where_clause
+    rows: List[BatchDeleteRow]
     explanation: str = ""
 
 batch_delete_block_schema = {
     "name": "batch_delete_block",
     "description": (
-        "Delete multiple rows from one table in a single call. "
-        "If user says 'Remove these 5 items at once,' produce something like:\n"
-        "{\n"
-        '  "table_name": "fridge_items",\n'
-        '  "rows": [\n'
-        '     {"where_clause":"WHERE id=7"},\n'
-        '     {"where_clause":"WHERE name=\'spinach\'"}\n'
-        '   ],\n'
-        '  "explanation":"Deleting multiple items at once."\n'
-        '}'
+        "Delete multiple rows from one table in a single call."
     ),
     "parameters": {
         "type": "object",
         "properties": {
-            "table_name": {
-                "type": "string",
-                "description": "The DB table to delete from, e.g. 'fridge_items'"
-            },
+            "table_name": {"type": "string"},
             "rows": {
                 "type": "array",
                 "items": {
                     "type": "object",
                     "properties": {
-                        "where_clause": {
-                            "type": "string",
-                            "description": "WHERE clause, e.g. 'WHERE name=\\'spinach\\''"
-                        }
+                        "where_clause": {"type": "string"}
                     },
                     "required": ["where_clause"]
-                },
-                "description": "List of row-level deletes"
+                }
             },
-            "explanation": {
-                "type": "string",
-                "description": "Reason or comment about these deletions"
-            }
+            "explanation": {"type": "string"}
         },
         "required": ["table_name","rows"],
         "additionalProperties": False
     }
 }
 
+
+#
+# 8) chat_block
+#
 class ChatBlockArguments(BaseModel):
-    user_prompt: str                 # The question or text the user (or system) wants to feed into chat
-    context: Optional[str] = None    # If we have an optional large context
+    user_prompt: str
+    context: Optional[str] = None
 
 chat_block_schema = {
     "name": "chat_block",
     "description": (
         "Perform an open-ended chat or reasoning step. "
         "We supply 'user_prompt' plus optional 'context'. "
-        "In response, produce text in 'response_text' if needed."
+        "Return { response_text:'...' }."
     ),
     "parameters": {
         "type": "object",
         "properties": {
-            "user_prompt": {
-                "type": "string",
-                "description": "The user or system query we want to chat or reason about"
-            },
-            "context": {
-                "type": "string",
-                "description": "Optional large context or relevant background we want to feed the model"
-            }
+            "user_prompt": {"type": "string"},
+            "context": {"type": "string"}
         },
         "required": ["user_prompt"],
         "additionalProperties": False
     }
 }
+
 
 ALL_FUNCTION_SCHEMAS = [
     plan_tasks_schema,
@@ -318,5 +292,5 @@ ALL_FUNCTION_SCHEMAS = [
     batch_insert_block_schema,
     batch_update_block_schema,
     batch_delete_block_schema,
-    chat_block_schema
+    chat_block_schema  # new
 ]

@@ -16,8 +16,8 @@ import logging
 
 from agent.global_store import TABLE_SCHEMAS, CURRENT_DATETIME_FN, get_now
 
-# (1) Import your dynamic_schema
-#from .dynamic_schema import build_table_schemas
+# (1) If you need dynamic_schema, uncomment below if relevant:
+from dynamic_schema import build_table_schemas
 
 load_dotenv()
 openai.api_key = os.getenv("OPENAI_API_KEY")
@@ -33,23 +33,23 @@ logging.basicConfig(
 )
 logger = logging.getLogger("agent")
 
-# GLOBALS:
-
+###############################################################################
+# STARTUP
+###############################################################################
 @app.on_event("startup")
 def startup_event():
     """
     Here we dynamically build the schema info, etc.
     """
-    # 1) Build or load dynamic schema
-    from dynamic_schema import build_table_schemas
+    # If you have a dynamic schema builder, enable below:
     new_schema = build_table_schemas()
-
-    # Assign to global_store variables
-    from agent.global_store import TABLE_SCHEMAS, CURRENT_DATETIME_FN
     TABLE_SCHEMAS.clear()
     TABLE_SCHEMAS.update(new_schema)
 
+    # We do set CURRENT_DATETIME_FN:
+    global CURRENT_DATETIME_FN
     CURRENT_DATETIME_FN = get_now
+
 ###############################################################################
 # 1) /api/image_recognize
 ###############################################################################
@@ -60,18 +60,13 @@ async def image_recognize_endpoint(
     model: str = Form("gpt-4o-mini")
 ):
     """
-    Example route for image recognition. 
-    1) Convert image to base64
-    2) Possibly pass to an image-based model
-    3) Store results
+    Example route for image recognition.
     """
     db = SessionLocal()
     try:
-        # (A) Base64-encode the image
         raw_img = await file.read()
         user_image_b64 = base64.b64encode(raw_img).decode("utf-8")
 
-        # (B) Build content parts (prompt + image)
         content_parts = []
         if user_prompt.strip():
             content_parts.append({"type": "text", "text": user_prompt.strip()})
@@ -80,7 +75,6 @@ async def image_recognize_endpoint(
             "image_url": {"url": f"data:image/jpeg;base64,{user_image_b64}"}
         })
 
-        # (C) The instructions for the image model
         instructions = (
             "You are an expert image recognition AI. The user may provide a prompt + image. "
             "If no additional prompt is provided, put something like 'How can I help you with this image?' "
@@ -88,10 +82,8 @@ async def image_recognize_endpoint(
             "Return EXACT:\n<Title>...</Title>\n<Description>...</Description>\n<Response>...</Response>\n"
         )
 
-        # (D) Call the model
         from openai import OpenAI
         client = OpenAI(api_key=openai.api_key)
-
         try:
             resp = client.chat.completions.create(
                 model=model,
@@ -107,7 +99,6 @@ async def image_recognize_endpoint(
             logger.error("Error calling the image model: %s", e)
             return {"error": f"Model call failed: {str(e)}"}
 
-        # (E) Parse <Title>, <Description>, <Response>
         import re
         title_match = re.search(r"<Title>(.*?)</Title>", llm_text, re.DOTALL)
         desc_match = re.search(r"<Description>(.*?)</Description>", llm_text, re.DOTALL)
@@ -117,7 +108,6 @@ async def image_recognize_endpoint(
         image_desc = desc_match.group(1).strip() if desc_match else ""
         final_response = resp_match.group(1).strip() if resp_match else llm_text
 
-        # (F) Save to DB
         new_ex = ChatExchange(
             user_message=user_prompt,
             llm_response=final_response,
@@ -129,7 +119,6 @@ async def image_recognize_endpoint(
         db.commit()
         db.refresh(new_ex)
 
-        # (G) Also store + embed the image_desc in documents
         new_doc = Document(
             filename=f"image_{new_ex.id}.jpg",
             file_content=raw_img,
@@ -140,7 +129,6 @@ async def image_recognize_endpoint(
         db.commit()
         db.refresh(new_doc)
 
-        # optional: vector-store indexing
         if image_desc.strip():
             ingest_document(new_doc.id, image_desc)
 
@@ -165,7 +153,6 @@ async def chat_endpoint(
     """
     If user only sends text => short-term memory approach.
     We'll fetch last N messages from DB, passing any 'image_description' as context.
-    The model can see ~5 prior user/assistant messages.
     """
     ROLLING_WINDOW_SIZE = 5
     db = SessionLocal()
@@ -188,11 +175,9 @@ async def chat_endpoint(
 
             if user_txt.strip():
                 conversation.append({"role": "user", "content": user_txt})
-
             if exch.llm_response and exch.llm_response.strip():
                 conversation.append({"role": "assistant", "content": exch.llm_response.strip()})
 
-        # add the new user text
         conversation.append({"role": "user", "content": message.strip()})
 
         from openai import OpenAI
@@ -210,7 +195,6 @@ async def chat_endpoint(
             logger.error("Error calling text model: %s", e)
             llm_msg = "(Error calling text model.)"
 
-        # store the conversation
         new_ex = ChatExchange(user_message=message, llm_response=llm_msg)
         db.add(new_ex)
         db.commit()
@@ -323,12 +307,15 @@ def agent_endpoint(
     user_input: str = Body(..., embed=True),
     chosen_model: str = Body("gpt-3.5-turbo", embed=True)
 ):
+    """
+    The main agent endpoint: calls run_agent(...) from orchestrator.py
+    """
     logger.info(f"Received user_input for agent: {user_input}")
     task_memory = {}
     if chosen_model and chosen_model.strip():
         task_memory["agent_model"] = chosen_model.strip()
 
-    # import here to avoid top-level cyclical references
+    # NEW OR UPDATED: import orchestrator with the newly refined approach
     from agent.orchestrator import run_agent
 
     final_answer, debug_info = run_agent(user_input, task_memory)
