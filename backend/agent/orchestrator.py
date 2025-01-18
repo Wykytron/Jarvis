@@ -1,3 +1,5 @@
+# v0.2/backend/agent/orchestrator.py
+
 import json
 import os
 import logging
@@ -104,14 +106,10 @@ def build_system_prompt_for_block(block_name: str, block_description: str, task_
     plus dynamic DB schema. We read the .md file for the block from prompts/
     and then add the minimal (subset) data from the agent's memory.
     """
-    # We read the block-specific .md prompt from the prompts folder if present
-    # (like parse_block_prompt.md, sql_block_prompt.md, etc.).
-    # Then we embed dynamic DB info + minimal memory (like parse_data or sql_data) below.
-
     base_dir = os.path.dirname(os.path.abspath(__file__))
     prompt_path = os.path.join(base_dir, "prompts", f"{block_name}_prompt.md")
 
-    # Fallback if there's no .md file for this block name
+    # Fallback if .md file not found
     block_instructions = ""
     if os.path.exists(prompt_path):
         with open(prompt_path, "r", encoding="utf-8") as f:
@@ -119,7 +117,6 @@ def build_system_prompt_for_block(block_name: str, block_description: str, task_
 
     def minimal_parse_data():
         subset = {}
-        # Possibly user input, or last_sql_rows
         subset["original_user_input"] = task_memory.get("original_user_input", "")
         if "last_sql_rows" in task_memory:
             subset["db_rows"] = task_memory["last_sql_rows"]
@@ -135,7 +132,6 @@ def build_system_prompt_for_block(block_name: str, block_description: str, task_
 
     dynamic_schema_str = _assemble_dynamic_schema_note()
 
-    # For brevity, we handle block_name-specific additions:
     if block_name == "parse_block":
         subset = minimal_parse_data()
         appended_data = "Minimal parse inputs => " + json.dumps(subset, default=str)
@@ -170,23 +166,22 @@ def build_system_prompt_for_block(block_name: str, block_description: str, task_
 
     elif block_name == "reflect_block":
         memory_dump = "Here is your entire memory => " + json.dumps(task_memory, default=str)
-        return block_instructions + "\n\n"  + dynamic_schema_str + "\n\n" + memory_dump
+        return block_instructions + "\n\n" + dynamic_schema_str + "\n\n" + memory_dump
 
     else:
-        # If there's no .md file or we didn't handle it above, just return the fallback
+        # Fallback if unknown block or no .md
         return block_instructions + f"\n\n(Unknown block='{block_name}', minimal memory => {json.dumps(task_memory, default=str)})"
 
 
 def call_block_llm(block_name: str, block_description: str, task_memory: dict, debug_info: list):
     """
     Calls GPT with the appropriate block schema, merging the block's .md prompt
-    plus dynamic DB schema, plus minimal memory context. 
+    plus dynamic DB schema, plus minimal memory context.
     If GPT returns a function_call => parse arguments and dispatch.
     """
     logger.info(f"[call_block_llm] block={block_name}, desc={block_description}")
     debug_info.append(f"[block_llm] block={block_name}, desc={block_description}")
 
-    # Identify which schema to use from ALL_FUNCTION_SCHEMAS
     schema = None
     for s in ALL_FUNCTION_SCHEMAS:
         if s["name"] == block_name:
@@ -217,8 +212,6 @@ def call_block_llm(block_name: str, block_description: str, task_memory: dict, d
 
     choice = resp.choices[0]
     fn_call = choice.message.function_call
-
-    # If no function_call => fallback parse
     if not fn_call:
         content_str = choice.message.content or ""
         debug_info.append(f"[block_llm] no function_call => fallback parse = {content_str}")
@@ -236,7 +229,6 @@ def call_block_llm(block_name: str, block_description: str, task_memory: dict, d
 
         return {"error": "No function_call returned and fallback parse didn't match block."}
     else:
-        # We do have a function_call => parse arguments
         fn_args_str = fn_call.arguments
         debug_info.append(f"[block_llm] function_call args => {fn_args_str}")
         logger.info(f"[call_block_llm] function_call args => {fn_args_str}")

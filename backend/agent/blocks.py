@@ -76,7 +76,6 @@ def guess_expiration_date_from_text(text: str, current_dt_fn):
       - "in 3 days"
       - "in 2 weeks"
     etc.
-
     Returns an ISO date string or None.
     """
     # 1) known synonyms "expires tomorrow", etc.
@@ -208,7 +207,7 @@ def handle_sql_block(args: Dict[str, Any], task_memory: dict, debug_info: list) 
             msg = f"[sql_block] SELECT on '{table_name}' => ALWAYS_DENY"
             debug_info.append(msg)
             logger.warning(msg)
-            return {"error": msg}
+            return {"error": msg, "success": False}
 
         col_list_str = "*"
         if columns:
@@ -220,12 +219,12 @@ def handle_sql_block(args: Dict[str, Any], task_memory: dict, debug_info: list) 
         if permission_mode == "ALWAYS_DENY":
             msg = f"[sql_block] INSERT => table '{table_name}' => ALWAYS_DENY"
             debug_info.append(msg)
-            return {"error": msg}
+            return {"error": msg, "success": False}
 
         if len(columns) != len(values):
             msg = f"[sql_block] Mismatch => columns={columns}, values={values}"
             debug_info.append(msg)
-            return {"error": msg}
+            return {"error": msg, "success": False}
 
         col_list_str = ", ".join(columns)
         val_list_str = ", ".join(quote_if_needed(v) for v in values)
@@ -238,13 +237,13 @@ def handle_sql_block(args: Dict[str, Any], task_memory: dict, debug_info: list) 
             msg = f"[sql_block] Writes to '{table_name}' => ALWAYS_DENY"
             debug_info.append(msg)
             logger.warning(msg)
-            return {"error": msg}
+            return {"error": msg, "success": False}
 
         if not where_clause.upper().startswith("WHERE"):
             msg = f"[sql_block] {action_type} requested but no where_clause => not allowed!"
             debug_info.append(msg)
             logger.warning(msg)
-            return {"error": msg}
+            return {"error": msg, "success": False}
 
         ci_where = build_case_insensitive_where(where_clause)
         debug_info.append(f"[sql_block] where => {ci_where}")
@@ -254,7 +253,7 @@ def handle_sql_block(args: Dict[str, Any], task_memory: dict, debug_info: list) 
             if len(columns) != len(values):
                 msg = f"[sql_block] mismatch col vs val => {columns} vs {values}"
                 debug_info.append(msg)
-                return {"error": msg}
+                return {"error": msg, "success": False}
             set_clauses = []
             for c, v in zip(columns, values):
                 set_clauses.append(f"{c}={quote_if_needed(v)}")
@@ -271,7 +270,7 @@ def handle_sql_block(args: Dict[str, Any], task_memory: dict, debug_info: list) 
     else:
         msg = f"[sql_block] unrecognized action_type={action_type}"
         debug_info.append(msg)
-        return {"error": msg}
+        return {"error": msg, "success": False}
 
 ###############################################################################
 # SELECT / WRITE queries
@@ -297,7 +296,7 @@ def run_select_query(sql_query: str, explanation: str, debug_info: list, task_me
         db.close()
 
     if error_msg:
-        return {"error": error_msg, "sql_query": sql_query}
+        return {"error": error_msg, "success": False, "sql_query": sql_query}
 
     task_memory["last_sql_rows"] = rows_data
     return {
@@ -327,7 +326,7 @@ def run_write_query(sql_query: str, explanation: str, debug_info: list) -> dict:
         db.close()
 
     if error_msg:
-        return {"error": error_msg, "sql_query": sql_query}
+        return {"error": error_msg, "success": False, "sql_query": sql_query}
 
     return {
         "success": True,
@@ -352,7 +351,7 @@ def handle_batch_insert_block(args: Dict[str, Any], task_memory: dict, debug_inf
         msg = f"[batch_insert_block] => table '{table_name}' => ALWAYS_DENY"
         debug_info.append(msg)
         logger.warning(msg)
-        return {"error": msg}
+        return {"error": msg, "success": False}
 
     inserted_count = 0
     error_msg = None
@@ -382,7 +381,7 @@ def handle_batch_insert_block(args: Dict[str, Any], task_memory: dict, debug_inf
         db.close()
 
     if error_msg:
-        return {"error": error_msg, "rows_inserted": inserted_count, "explanation": explanation}
+        return {"error": error_msg, "success": False, "rows_inserted": inserted_count, "explanation": explanation}
 
     return {
         "success": True,
@@ -404,7 +403,7 @@ def handle_batch_update_block(args: Dict[str, Any], task_memory: dict, debug_inf
         msg = f"[batch_update_block] => table '{table_name}' => ALWAYS_DENY"
         debug_info.append(msg)
         logger.warning(msg)
-        return {"error": msg}
+        return {"error": msg, "success": False}
 
     updated_count = 0
     error_msg = None
@@ -441,7 +440,8 @@ def handle_batch_update_block(args: Dict[str, Any], task_memory: dict, debug_inf
         db.close()
 
     if error_msg:
-        return {"error": error_msg, "rows_affected": updated_count, "explanation": explanation}
+        return {"error": error_msg, "success": False, "rows_affected": updated_count, "explanation": explanation}
+
     return {
         "success": True,
         "rows_affected": updated_count,
@@ -462,7 +462,7 @@ def handle_batch_delete_block(args: Dict[str, Any], task_memory: dict, debug_inf
         msg = f"[batch_delete_block] => table '{table_name}' => ALWAYS_DENY"
         debug_info.append(msg)
         logger.warning(msg)
-        return {"error": msg}
+        return {"error": msg, "success": False}
 
     deleted_count = 0
     error_msg = None
@@ -490,7 +490,7 @@ def handle_batch_delete_block(args: Dict[str, Any], task_memory: dict, debug_inf
         db.close()
 
     if error_msg:
-        return {"error": error_msg, "rows_affected": deleted_count, "explanation": explanation}
+        return {"error": error_msg, "success": False, "rows_affected": deleted_count, "explanation": explanation}
 
     return {
         "success": True,
@@ -503,7 +503,7 @@ def handle_batch_delete_block(args: Dict[str, Any], task_memory: dict, debug_inf
 ###############################################################################
 def handle_output_block(args: Dict[str, Any], task_memory: dict, debug_info: list) -> dict:
     """
-    The output_block is an older final step approach. 
+    The output_block is an older final step approach.
     Now we typically rely on reflect_block, but if used:
      - produce a final_answer from recent_sql_result or user-provided final_message
     """
@@ -550,7 +550,7 @@ def handle_output_block(args: Dict[str, Any], task_memory: dict, debug_info: lis
 ###############################################################################
 def handle_chat_block(args: Dict[str, Any], task_memory: dict, debug_info: list) -> dict:
     """
-    chat_block: open-ended conversation or reasoning. 
+    chat_block: open-ended conversation or reasoning.
     Return => {"response_text":"some text"}.
     """
     user_prompt = args.get("user_prompt", "")
