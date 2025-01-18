@@ -284,6 +284,58 @@ chat_block_schema = {
 }
 
 
+#
+# 9) reflect_block (NEW)
+#
+class ReflectBlockArguments(BaseModel):
+    reasoning: str
+    final_message: Optional[str] = None
+    data_output: Optional[Any] = None
+    additional_tasks: Optional[List[PlanTaskItem]] = None
+
+reflect_block_schema = {
+    "name": "reflect_block",
+    "description": (
+        "Reflect on the entire task memory. "
+        "You can optionally provide final_message to end, data_output if you want to return structured data, "
+        "or additional_tasks if more steps are needed."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "reasoning": {
+                "type": "string",
+                "description": "Your chain-of-thought or reflection"
+            },
+            "final_message": {
+                "type": "string",
+                "description": "Optional user-facing text to finalize if done"
+            },
+            "data_output": {
+                "type": "object",
+                "description": "Optional structured data to return with final_message"
+            },
+            "additional_tasks": {
+                "type": "array",
+                "description": "Optional new tasks to add if more steps are needed",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "block": {"type": "string"},
+                        "description": {"type": "string"},
+                        "title": {"type": "string"},
+                        "reasoning": {"type": "string"}
+                    },
+                    "required": ["block","description","title","reasoning"]
+                }
+            }
+        },
+        "required": ["reasoning"],
+        "additionalProperties": False
+    }
+}
+
+
 ALL_FUNCTION_SCHEMAS = [
     plan_tasks_schema,
     sql_block_schema,
@@ -292,5 +344,6 @@ ALL_FUNCTION_SCHEMAS = [
     batch_insert_block_schema,
     batch_update_block_schema,
     batch_delete_block_schema,
-    chat_block_schema  # new
+    chat_block_schema,
+    reflect_block_schema  # <-- newly added
 ]

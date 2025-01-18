@@ -4,17 +4,1172 @@ You are ChatGPT, a helpful developer assistant. You have been provided with a su
 === FOLDER STRUCTURE (SELECTED) ===
 v0.2/
     backend/
+        database.py
+        main.py
         agent/
-            orchestrator.py
             blocks.py
+            orchestrator.py
             schemas.py
-            prompts/
-                plan_prompt.md
+
+    frontend/
+        App.tsx
+        screens/
+            HomeScreen.tsx
+            SettingsScreen.tsx
 
 === FILE CONTENTS ===
 
+--- database.py ---
+# database.py
+
+from sqlalchemy import (
+    create_engine, Column, Integer, Text, DateTime, String,
+    LargeBinary, Float, Boolean, Date, ForeignKey
+)
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker, relationship
+from datetime import datetime
+
+###############################################################################
+# SQLAlchemy Setup
+###############################################################################
+Base = declarative_base()
+engine = create_engine("sqlite:///chat_history.db", echo=False)
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+
+###############################################################################
+# ChatExchange & Document Tables
+###############################################################################
+class ChatExchange(Base):
+    """
+    Stores user <-> LLM interactions. Also supports storing images
+    if user sent an image + prompt. The table includes:
+      - user_message: The original text from the user
+      - llm_response: The LLM’s final text
+      - user_image_b64: If an image was provided, store its base64
+      - image_title / image_description: If the LLM provided structured info
+    """
+    __tablename__ = "chat_exchanges"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_message = Column(Text, nullable=True)
+    llm_response = Column(Text, nullable=True)
+    timestamp = Column(DateTime, default=datetime.utcnow)
+
+    # If user sent an image:
+    user_image_b64 = Column(Text, nullable=True)
+    image_title = Column(Text, nullable=True)
+    image_description = Column(Text, nullable=True)
+
+
+class Document(Base):
+    """
+    Example table for storing uploaded documents (like PDFs, images)
+    as binary data plus extracted text content. Could also be used
+    by the parse_block if we want the LLM to parse text in them.
+    """
+    __tablename__ = "documents"
+
+    id = Column(Integer, primary_key=True, index=True)
+    filename = Column(String)
+    file_content = Column(LargeBinary)
+    upload_time = Column(DateTime, default=datetime.utcnow)
+    text_content = Column(Text, nullable=True)
+    description = Column(Text, nullable=True)
+
+###############################################################################
+# Domain-Specific Tables (Fridge Items, Shopping List, Invoices, etc.)
+###############################################################################
+class FridgeItem(Base):
+    """
+    The 'fridge_items' table. Here is where we store items that
+    the user has physically in their fridge. For example:
+      - name='Milk', quantity=1.0, unit='liter', expiration_date=YYYY-MM-DD, category='dairy'
+    The LLM will do an INSERT/UPDATE with 'sql_block' if the user requests to add or modify items.
+    """
+    __tablename__ = "fridge_items"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, nullable=False)
+    quantity = Column(Float, default=1.0)
+    unit = Column(String, default="unit")
+    expiration_date = Column(Date, nullable=True)
+    category = Column(String, nullable=True)
+
+
+class ShoppingItem(Base):
+    """
+    The 'shopping_items' table for items on a shopping list.
+    For example:
+      - name='Tomatoes', desired_quantity=5, unit='units', purchased=False
+    """
+    __tablename__ = "shopping_items"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, nullable=False)
+    desired_quantity = Column(Float, default=1.0)
+    unit = Column(String, default="unit")
+    purchased = Column(Boolean, default=False)
+
+
+class Invoice(Base):
+    """
+    The 'invoices' table: one row per invoice/receipt. This table is
+    'REQUIRE_USER' in table_permissions, meaning user must confirm writes
+    (in your baby-step scenario we assume user_permission=True).
+    Potential usage: 
+      - parse_block => parse invoice text => produce structured line items
+      - sql_block => do INSERT INTO invoices(...) plus invoice_items(...)
+    """
+    __tablename__ = "invoices"
+
+    id = Column(Integer, primary_key=True, index=True)
+    date = Column(Date, nullable=False)  # e.g. date of purchase
+    total_amount = Column(Float, default=0.0)
+    store_name = Column(String, nullable=True)
+
+    # Relationship: invoice has many invoice_items
+    items = relationship("InvoiceItem", back_populates="invoice")
+
+
+class InvoiceItem(Base):
+    """
+    The line items for a given invoice, e.g. 
+      - name='Chicken Breast', quantity=2.0, price_per_unit=5.0, invoice_id=?
+    """
+    __tablename__ = "invoice_items"
+
+    id = Column(Integer, primary_key=True, index=True)
+    invoice_id = Column(Integer, ForeignKey("invoices.id"))
+    name = Column(String, nullable=False)
+    quantity = Column(Float, default=1.0)
+    price_per_unit = Column(Float, default=0.0)
+
+    invoice = relationship("Invoice", back_populates="items")
+
+
+class MonthlySpending(Base):
+    """
+    Example table for monthly spend tracking. 
+    Another 'ALWAYS_DENY' for writes in baby step, so agent
+    cannot do INSERT/UPDATE/DELETE on monthly_spendings.
+    """
+    __tablename__ = "monthly_spendings"
+
+    id = Column(Integer, primary_key=True, index=True)
+    year_month = Column(String, nullable=False)  # e.g. "2025-01"
+    total_spent = Column(Float, default=0.0)
+
+###############################################################################
+# Create all tables once
+###############################################################################
+Base.metadata.create_all(bind=engine)
+
+###############################################################################
+# Table Permissions
+###############################################################################
+# We define which tables are ALWAYS_ALLOW, REQUIRE_USER, or ALWAYS_DENY for writes.
+# This is used by the 'sql_block' to decide if an INSERT/UPDATE/DELETE is permitted.
+table_permissions = {
+    "chat_exchanges":    "ALWAYS_DENY",   # never allow writes from the LLM
+    "documents":         "ALWAYS_DENY",   # same reason
+    "fridge_items":      "ALWAYS_ALLOW",  # can always INSERT/UPDATE
+    "shopping_items":    "ALWAYS_ALLOW",  # can always INSERT/UPDATE
+    "invoices":          "REQUIRE_USER",  # user_permission=True for now
+    "invoice_items":     "REQUIRE_USER",  # user_permission=True for now
+    "monthly_spendings": "ALWAYS_DENY"    # denies writes
+}
+
+--- main.py ---
+# main.py
+
+from fastapi import FastAPI, UploadFile, File, Form, Body
+import os
+import base64
+import uuid
+import re
+from dotenv import load_dotenv
+from datetime import datetime
+
+from database import SessionLocal, ChatExchange, Document
+from vectorstore import ingest_document, query_docs
+from parser_utils import parse_file
+import openai
+import logging
+
+from agent.global_store import TABLE_SCHEMAS, CURRENT_DATETIME_FN, get_now
+
+# (1) If you need dynamic_schema, uncomment below if relevant:
+from dynamic_schema import build_table_schemas
+
+load_dotenv()
+openai.api_key = os.getenv("OPENAI_API_KEY")
+
+app = FastAPI()
+
+###############################################################################
+# LOGGING SETUP
+###############################################################################
+logging.basicConfig(
+    level=logging.INFO,  # or DEBUG if needed
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
+logger = logging.getLogger("agent")
+
+###############################################################################
+# STARTUP
+###############################################################################
+@app.on_event("startup")
+def startup_event():
+    """
+    Here we dynamically build the schema info, etc.
+    """
+    # If you have a dynamic schema builder, enable below:
+    new_schema = build_table_schemas()
+    TABLE_SCHEMAS.clear()
+    TABLE_SCHEMAS.update(new_schema)
+
+    # We do set CURRENT_DATETIME_FN:
+    global CURRENT_DATETIME_FN
+    CURRENT_DATETIME_FN = get_now
+
+###############################################################################
+# 1) /api/image_recognize
+###############################################################################
+@app.post("/api/image_recognize")
+async def image_recognize_endpoint(
+    file: UploadFile = File(...),
+    user_prompt: str = Form(""),
+    model: str = Form("gpt-4o-mini")
+):
+    """
+    Example route for image recognition.
+    """
+    db = SessionLocal()
+    try:
+        raw_img = await file.read()
+        user_image_b64 = base64.b64encode(raw_img).decode("utf-8")
+
+        content_parts = []
+        if user_prompt.strip():
+            content_parts.append({"type": "text", "text": user_prompt.strip()})
+        content_parts.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:image/jpeg;base64,{user_image_b64}"}
+        })
+
+        instructions = (
+            "You are an expert image recognition AI. The user may provide a prompt + image. "
+            "If no additional prompt is provided, put something like 'How can I help you with this image?' "
+            "into the <Response> section.\n"
+            "Return EXACT:\n<Title>...</Title>\n<Description>...</Description>\n<Response>...</Response>\n"
+        )
+
+        from openai import OpenAI
+        client = OpenAI(api_key=openai.api_key)
+        try:
+            resp = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": instructions},
+                    {"role": "user", "content": content_parts},
+                ],
+                max_tokens=400,
+                temperature=0.7
+            )
+            llm_text = resp.choices[0].message.content or ""
+        except Exception as e:
+            logger.error("Error calling the image model: %s", e)
+            return {"error": f"Model call failed: {str(e)}"}
+
+        import re
+        title_match = re.search(r"<Title>(.*?)</Title>", llm_text, re.DOTALL)
+        desc_match = re.search(r"<Description>(.*?)</Description>", llm_text, re.DOTALL)
+        resp_match = re.search(r"<Response>(.*?)</Response>", llm_text, re.DOTALL)
+
+        image_title = title_match.group(1).strip() if title_match else ""
+        image_desc = desc_match.group(1).strip() if desc_match else ""
+        final_response = resp_match.group(1).strip() if resp_match else llm_text
+
+        new_ex = ChatExchange(
+            user_message=user_prompt,
+            llm_response=final_response,
+            user_image_b64=user_image_b64,
+            image_title=image_title,
+            image_description=image_desc
+        )
+        db.add(new_ex)
+        db.commit()
+        db.refresh(new_ex)
+
+        new_doc = Document(
+            filename=f"image_{new_ex.id}.jpg",
+            file_content=raw_img,
+            text_content=image_desc,
+            description=image_title
+        )
+        db.add(new_doc)
+        db.commit()
+        db.refresh(new_doc)
+
+        if image_desc.strip():
+            ingest_document(new_doc.id, image_desc)
+
+        return {
+            "title": image_title,
+            "description": image_desc,
+            "response": final_response,
+            "exchange_id": new_ex.id
+        }
+    finally:
+        db.close()
+
+
+###############################################################################
+# 2) /api/chat => text-based short-term memory
+###############################################################################
+@app.post("/api/chat")
+async def chat_endpoint(
+    message: str = Form(...),
+    model: str = Form("gpt-3.5-turbo")
+):
+    """
+    If user only sends text => short-term memory approach.
+    We'll fetch last N messages from DB, passing any 'image_description' as context.
+    """
+    ROLLING_WINDOW_SIZE = 5
+    db = SessionLocal()
+    try:
+        old_exs = db.query(ChatExchange) \
+                    .order_by(ChatExchange.timestamp.desc()) \
+                    .limit(ROLLING_WINDOW_SIZE).all()
+        old_exs.reverse()
+
+        system_msg = {
+            "role": "system",
+            "content": "You are a helpful text-based assistant. You recall the last few messages."
+        }
+        conversation = [system_msg]
+
+        for exch in old_exs:
+            user_txt = exch.user_message.strip() if exch.user_message else ""
+            if exch.image_description and exch.image_description.strip():
+                user_txt += f"\n[Previous Image Description: {exch.image_description.strip()}]"
+
+            if user_txt.strip():
+                conversation.append({"role": "user", "content": user_txt})
+            if exch.llm_response and exch.llm_response.strip():
+                conversation.append({"role": "assistant", "content": exch.llm_response.strip()})
+
+        conversation.append({"role": "user", "content": message.strip()})
+
+        from openai import OpenAI
+        client = OpenAI(api_key=openai.api_key)
+
+        try:
+            resp = client.chat.completions.create(
+                model=model,
+                messages=conversation,
+                max_tokens=400,
+                temperature=0.7
+            )
+            llm_msg = resp.choices[0].message.content
+        except Exception as e:
+            logger.error("Error calling text model: %s", e)
+            llm_msg = "(Error calling text model.)"
+
+        new_ex = ChatExchange(user_message=message, llm_response=llm_msg)
+        db.add(new_ex)
+        db.commit()
+        db.refresh(new_ex)
+
+        return {"response": llm_msg}
+    finally:
+        db.close()
+
+
+###############################################################################
+# 3) /api/history => returns text + optional image
+###############################################################################
+@app.get("/api/history")
+def get_chat_history():
+    """
+    Simple route to return all ChatExchange rows in ascending timestamp order.
+    """
+    db = SessionLocal()
+    try:
+        rows = db.query(ChatExchange).order_by(ChatExchange.timestamp.asc()).all()
+        hist = []
+        for r in rows:
+            item = {
+                "id": r.id,
+                "timestamp": r.timestamp.isoformat(),
+                "user_message": r.user_message or "",
+                "llm_response": r.llm_response or ""
+            }
+            if r.user_image_b64:
+                item["user_image_b64"] = r.user_image_b64
+            if r.image_title:
+                item["image_title"] = r.image_title
+            if r.image_description:
+                item["image_description"] = r.image_description
+            hist.append(item)
+        return {"history": hist}
+    finally:
+        db.close()
+
+
+###############################################################################
+# 4) /api/ingest => doc ingestion
+###############################################################################
+@app.post("/api/ingest")
+async def ingest_endpoint(
+    file: UploadFile = File(...),
+    description: str = Form(None)
+):
+    """
+    Example route for ingesting a file, extracting text, storing in DB, then
+    indexing into a vector store for semantic search.
+    """
+    raw_bytes = await file.read()
+    filename = file.filename or f"unknown-{uuid.uuid4()}"
+    extension = filename.rsplit(".", 1)[-1].lower()
+    text_content = parse_file(raw_bytes, extension)
+
+    if not description or not description.strip():
+        base_name = filename.rsplit(".", 1)[0]
+        description = base_name
+
+    db = SessionLocal()
+    try:
+        new_doc = Document(
+            filename=filename,
+            file_content=raw_bytes,
+            text_content=text_content,
+            description=description
+        )
+        db.add(new_doc)
+        db.commit()
+        db.refresh(new_doc)
+
+        doc_id = new_doc.id
+        if text_content.strip():
+            ingest_document(doc_id, text_content)
+
+        return {
+            "status": "ok",
+            "doc_id": doc_id,
+            "filename": filename,
+            "description": description,
+            "text_length": len(text_content)
+        }
+    finally:
+        db.close()
+
+
+###############################################################################
+# 5) /api/search_docs => vector search
+###############################################################################
+@app.post("/api/search_docs")
+def search_docs_endpoint(
+    query: str = Body(..., embed=True),
+    top_k: int = Body(3, embed=True)
+):
+    """
+    Return the top_k similar documents from the vector store.
+    """
+    results = query_docs(query, top_k=top_k)
+    return {"results": results}
+
+
+###############################################################################
+# 6) /api/agent => The new Agent endpoint
+###############################################################################
+@app.post("/api/agent")
+def agent_endpoint(
+    user_input: str = Body(..., embed=True),
+    chosen_model: str = Body("gpt-3.5-turbo", embed=True)
+):
+    """
+    The main agent endpoint: calls run_agent(...) from orchestrator.py
+    """
+    logger.info(f"Received user_input for agent: {user_input}")
+    task_memory = {}
+    if chosen_model and chosen_model.strip():
+        task_memory["agent_model"] = chosen_model.strip()
+
+    # NEW OR UPDATED: import orchestrator with the newly refined approach
+    from agent.orchestrator import run_agent
+
+    final_answer, debug_info = run_agent(user_input, task_memory)
+    logger.info(f"Final answer from agent: {final_answer}")
+
+    return {
+        "final_answer": final_answer,
+        "debug_info": debug_info
+    }
+
+--- blocks.py ---
+# v0.2/backend/agent/blocks.py
+
+import re
+import json
+import logging
+from typing import Any, Dict
+from database import SessionLocal, table_permissions
+from sqlalchemy import text
+import datetime
+import openai
+
+logger = logging.getLogger("agent")
+
+###############################################################################
+# Synonyms for item names
+###############################################################################
+NAME_SYNONYMS = {
+    "tomato": "tomatoes",
+    "tomatoe": "tomatoes",
+    "tomatoes": "tomatoes",
+    # ...
+}
+
+###############################################################################
+# Synonyms for date offsets
+###############################################################################
+DATE_SYNONYMS = {
+    # existing shortcuts:
+    "today": 0,
+    "tomorrow": 1,
+    "next week": 7,
+    # NEW or UPDATED: more offset patterns
+}
+
+###############################################################################
+# Additional patterns for "in X days/weeks"
+###############################################################################
+# We'll parse things like "in 2 days," "in 3 weeks," etc.
+# If you like, you can expand to months or years.
+###############################################################################
+DAYS_REGEX = re.compile(r"(?i)\bin\s+(\d+)\s+day(s)?\b")
+WEEKS_REGEX = re.compile(r"(?i)\bin\s+(\d+)\s+week(s)?\b")
+
+###############################################################################
+# Utility to unify item names
+###############################################################################
+def dictionary_normalize_item_name(raw: str) -> str:
+    lowered = raw.strip().lower()
+    return NAME_SYNONYMS.get(lowered, lowered)
+
+###############################################################################
+# Attempt to extract quantity + unit from text
+###############################################################################
+def guess_quantity_and_unit_from_text(text: str) -> (float, str):
+    match = re.search(
+        r"(\d+(?:\.\d+)?)\s*(liter|liters|unit|units|bag|bags|piece|pieces)\b",
+        text,
+        re.IGNORECASE
+    )
+    if match:
+        qty_str = match.group(1)
+        unit_str = match.group(2)
+        try:
+            qty_val = float(qty_str)
+        except:
+            qty_val = 1.0
+        return (qty_val, unit_str.lower())
+    else:
+        return (None, None)
+
+###############################################################################
+# Main date-guessing function
+###############################################################################
+def guess_expiration_date_from_text(text: str, current_dt_fn):
+    """
+    Looks for phrases like:
+      - "expires next week"
+      - "expiring tomorrow"
+      - "expiry today"
+      - "in 3 days"
+      - "in 2 weeks"
+    etc.
+
+    Returns an ISO date string or None.
+    """
+    # 1) Check the simpler known synonyms first (e.g. "next week", "tomorrow")
+    pat_syn = re.search(r"(expires|expiring|expiry)\s+(today|tomorrow|next week)\b", text, re.IGNORECASE)
+    if pat_syn:
+        phrase = pat_syn.group(2).lower()
+        offset_days = DATE_SYNONYMS.get(phrase, 0)
+        now_dt = current_dt_fn() if current_dt_fn else datetime.datetime.utcnow()
+        real_dt = now_dt + datetime.timedelta(days=offset_days)
+        return real_dt.strftime("%Y-%m-%d")
+
+    # 2) Check "in X days"
+    #    e.g. "in 3 days"
+    pat_days = DAYS_REGEX.search(text)
+    if pat_days:
+        offset_days = int(pat_days.group(1))
+        now_dt = current_dt_fn() if current_dt_fn else datetime.datetime.utcnow()
+        real_dt = now_dt + datetime.timedelta(days=offset_days)
+        return real_dt.strftime("%Y-%m-%d")
+
+    # 3) Check "in X weeks"
+    #    e.g. "in 2 weeks"
+    pat_weeks = WEEKS_REGEX.search(text)
+    if pat_weeks:
+        offset_weeks = int(pat_weeks.group(1))
+        now_dt = current_dt_fn() if current_dt_fn else datetime.datetime.utcnow()
+        real_dt = now_dt + datetime.timedelta(days=7 * offset_weeks)
+        return real_dt.strftime("%Y-%m-%d")
+
+    # If none matched, return None
+    return None
+
+###############################################################################
+# The parse_block logic
+###############################################################################
+def handle_parse_block(args: Dict[str, Any], task_memory: dict, debug_info: list) -> dict:
+    """
+    parse_block can parse raw_text from the user, unify user text,
+    fill missing columns, etc. The final structured output goes into parsed_item.
+    """
+    raw_text = args.get("raw_text", "")
+    explanation = args.get("explanation", "")
+    parsed_item = args.get("parsed_item", {}) or {}
+
+    debug_info.append(f"[parse_block] raw_text={raw_text}, explanation={explanation}")
+
+    from agent.global_store import TABLE_SCHEMAS, CURRENT_DATETIME_FN
+
+    # Possibly unify synonyms if 'name' is in parsed_item
+    if "name" in parsed_item:
+        old_name = parsed_item["name"]
+        new_name = dictionary_normalize_item_name(old_name)
+        parsed_item["name"] = new_name
+        debug_info.append(f"[parse_block] Normalized name '{old_name}' => '{new_name}'")
+
+    # If no 'quantity' or 'unit', attempt to guess from raw_text
+    if "quantity" not in parsed_item or "unit" not in parsed_item:
+        (qty_guess, unit_guess) = guess_quantity_and_unit_from_text(raw_text)
+        if qty_guess is not None and "quantity" not in parsed_item:
+            parsed_item["quantity"] = qty_guess
+        if unit_guess is not None and "unit" not in parsed_item:
+            parsed_item["unit"] = unit_guess
+
+    # If no expiration_date yet, try to guess from raw_text
+    if "expiration_date" not in parsed_item or not parsed_item.get("expiration_date"):
+        dt_guess = guess_expiration_date_from_text(raw_text, CURRENT_DATETIME_FN)
+        if dt_guess:
+            parsed_item["expiration_date"] = dt_guess
+
+    # Optionally fill missing columns based on the target_table schema
+    target_table = task_memory.get("target_table", "")
+    col_list = TABLE_SCHEMAS.get(target_table, [])
+    debug_info.append(f"[parse_block] target_table => {target_table}, col_list => {col_list}")
+
+    for col_name in col_list:
+        if col_name not in parsed_item:
+            if col_name == "quantity":
+                parsed_item[col_name] = 1.0
+            elif col_name == "unit":
+                parsed_item[col_name] = "unit"
+            elif col_name == "expiration_date":
+                parsed_item[col_name] = None
+            elif col_name == "category":
+                parsed_item[col_name] = "misc"
+
+    debug_info.append(f"[parse_block] final parsed_item => {parsed_item}")
+
+    # Return only the parsed_item (and explanation if you like).
+    return {
+        "success": True,
+        "parsed_item": parsed_item,
+        "explanation": explanation
+    }
+
+###############################################################################
+# Case-insensitive WHERE for "WHERE name='tomatoes'"
+###############################################################################
+def build_case_insensitive_where(where_str: str) -> str:
+    pattern = r"(?i)WHERE\s+name\s*=\s*([\"'])(.*?)\1"
+    replacement = r"WHERE LOWER(name)=LOWER(\1\2\1)"
+    out = re.sub(pattern, replacement, where_str)
+    return out
+
+###############################################################################
+# Quoting logic for SQL
+###############################################################################
+def quote_if_needed(val: str) -> str:
+    if val is None:
+        return "NULL"
+    trimmed = val.strip()
+    if (trimmed.startswith("'") and trimmed.endswith("'")) or trimmed.replace(".", "", 1).isdigit():
+        return trimmed
+    return f"'{trimmed}'"
+
+###############################################################################
+# handle_sql_block
+###############################################################################
+def handle_sql_block(args: Dict[str, Any], task_memory: dict, debug_info: list) -> dict:
+    table_name = args.get("table_name", "").strip()
+    columns = args.get("columns", [])
+    values = args.get("values", [])
+    action_type = args.get("action_type", "").upper()
+    explanation = args.get("explanation", "")
+    where_clause = args.get("where_clause", "").strip()
+
+    debug_info.append(
+        f"[sql_block] table={table_name}, cols={columns}, vals={values}, "
+        f"action={action_type}, where={where_clause}"
+    )
+
+    permission_mode = table_permissions.get(table_name, "ALWAYS_DENY")
+    user_permission = True  # or do some real check
+
+    if action_type == "SELECT":
+        if permission_mode == "ALWAYS_DENY":
+            msg = f"[sql_block] SELECT on '{table_name}' => ALWAYS_DENY"
+            debug_info.append(msg)
+            logger.warning(msg)
+            return {"error": msg}
+
+        col_list_str = "*"
+        if columns:
+            col_list_str = ", ".join(columns)
+        sql_query = f"SELECT {col_list_str} FROM {table_name};"
+        return run_select_query(sql_query, explanation, debug_info, task_memory)
+
+    elif action_type == "INSERT":
+        if permission_mode == "ALWAYS_DENY":
+            msg = f"[sql_block] INSERT => table '{table_name}' => ALWAYS_DENY"
+            debug_info.append(msg)
+            return {"error": msg}
+
+        if len(columns) != len(values):
+            msg = f"[sql_block] Mismatch => columns={columns}, values={values}"
+            debug_info.append(msg)
+            return {"error": msg}
+
+        col_list_str = ", ".join(columns)
+        val_list_str = ", ".join(quote_if_needed(v) for v in values)
+        sql_query = f"INSERT INTO {table_name}({col_list_str}) VALUES({val_list_str});"
+        debug_info.append(f"[sql_block] final INSERT => {sql_query}")
+        return run_write_query(sql_query, explanation, debug_info)
+
+    elif action_type in ["UPDATE", "DELETE"]:
+        if permission_mode == "ALWAYS_DENY":
+            msg = f"[sql_block] Writes to '{table_name}' => ALWAYS_DENY"
+            debug_info.append(msg)
+            logger.warning(msg)
+            return {"error": msg}
+
+        if not where_clause.upper().startswith("WHERE"):
+            msg = f"[sql_block] {action_type} requested but no where_clause => not allowed!"
+            debug_info.append(msg)
+            logger.warning(msg)
+            return {"error": msg}
+
+        ci_where = build_case_insensitive_where(where_clause)
+        debug_info.append(f"[sql_block] where => {ci_where}")
+        where_clause = ci_where
+
+        if action_type == "UPDATE":
+            if len(columns) != len(values):
+                msg = f"[sql_block] mismatch col vs val => {columns} vs {values}"
+                debug_info.append(msg)
+                return {"error": msg}
+            set_clauses = []
+            for c, v in zip(columns, values):
+                set_clauses.append(f"{c}={quote_if_needed(v)}")
+            set_stmt = ", ".join(set_clauses)
+            sql_query = f"UPDATE {table_name} SET {set_stmt} {where_clause};"
+            debug_info.append(f"[sql_block] final UPDATE => {sql_query}")
+            return run_write_query(sql_query, explanation, debug_info)
+
+        elif action_type == "DELETE":
+            sql_query = f"DELETE FROM {table_name} {where_clause};"
+            debug_info.append(f"[sql_block] final DELETE => {sql_query}")
+            return run_write_query(sql_query, explanation, debug_info)
+
+    else:
+        msg = f"[sql_block] unrecognized action_type={action_type}"
+        debug_info.append(msg)
+        return {"error": msg}
+
+###############################################################################
+# SELECT, WRITE queries
+###############################################################################
+def run_select_query(sql_query: str, explanation: str, debug_info: list, task_memory: dict) -> dict:
+    db = SessionLocal()
+    rows_data = []
+    error_msg = None
+    try:
+        debug_info.append(f"[sql_block] Running SELECT => {sql_query}")
+        result = db.execute(text(sql_query))
+        all_rows = result.fetchall()
+        for row in all_rows:
+            row_dict = dict(row._mapping)
+            rows_data.append(row_dict)
+        debug_info.append(f"[sql_block] got {len(rows_data)} row(s)")
+        logger.info(f"[sql_block] success => SELECT '{sql_query}', rows={len(rows_data)}")
+    except Exception as e:
+        error_msg = str(e)
+        debug_info.append(f"[sql_block] select error => {error_msg}")
+        logger.warning(f"[sql_block] SELECT error => {error_msg}")
+    finally:
+        db.close()
+
+    if error_msg:
+        return {"error": error_msg, "sql_query": sql_query}
+
+    # Store rows for parse_block or other uses
+    task_memory["last_sql_rows"] = rows_data
+
+    return {
+        "success": True,
+        "rows_data": rows_data,
+        "explanation": explanation,
+        "rows_count": len(rows_data)
+    }
+
+def run_write_query(sql_query: str, explanation: str, debug_info: list) -> dict:
+    db = SessionLocal()
+    error_msg = None
+    rowcount = 0
+    try:
+        debug_info.append(f"[sql_block] Running WRITE => {sql_query}")
+        result = db.execute(text(sql_query))
+        rowcount = result.rowcount or 0
+        db.commit()
+        debug_info.append(f"[sql_block] rowcount={rowcount}")
+        logger.info(f"[sql_block] success => WRITE '{sql_query}', rowcount={rowcount}")
+    except Exception as e:
+        error_msg = str(e)
+        debug_info.append(f"[sql_block] write error => {error_msg}")
+        logger.warning(f"[sql_block] WRITE error => {error_msg}")
+        db.rollback()
+    finally:
+        db.close()
+
+    if error_msg:
+        return {"error": error_msg, "sql_query": sql_query}
+
+    return {
+        "success": True,
+        "rows_affected": rowcount,
+        "explanation": explanation
+    }
+
+###############################################################################
+# Batch blocks
+###############################################################################
+def handle_batch_insert_block(args: Dict[str, Any], task_memory: dict, debug_info: list) -> dict:
+    """
+    Insert multiple rows in a single call.
+    """
+    table_name = args.get("table_name","").strip()
+    rows_info = args.get("rows", [])
+    explanation = args.get("explanation","")
+
+    debug_info.append(f"[batch_insert] table={table_name}, #rows={len(rows_info)}")
+
+    permission_mode = table_permissions.get(table_name, "ALWAYS_DENY")
+    user_permission = True
+
+    if permission_mode == "ALWAYS_DENY":
+        msg = f"[batch_insert_block] => table '{table_name}' => ALWAYS_DENY"
+        debug_info.append(msg)
+        logger.warning(msg)
+        return {"error": msg}
+
+    inserted_count = 0
+    error_msg = None
+    db = SessionLocal()
+    try:
+        for row_data in rows_info:
+            columns = row_data.get("columns", [])
+            values = row_data.get("values", [])
+            if len(columns) != len(values):
+                raise ValueError(f"Mismatch => {columns} vs {values}")
+
+            col_list_str = ", ".join(columns)
+            val_list_str = ", ".join(quote_if_needed(v) for v in values)
+            sql_query = f"INSERT INTO {table_name} ({col_list_str}) VALUES ({val_list_str});"
+            debug_info.append(f"[batch_insert] => {sql_query}")
+
+            result = db.execute(text(sql_query))
+            rowcount = result.rowcount or 0
+            inserted_count += rowcount
+
+        db.commit()
+    except Exception as e:
+        error_msg = str(e)
+        debug_info.append(f"[batch_insert_block] error => {error_msg}")
+        logger.warning(f"[batch_insert_block] error => {error_msg}")
+        db.rollback()
+    finally:
+        db.close()
+
+    if error_msg:
+        return {"error": error_msg, "rows_inserted": inserted_count, "explanation": explanation}
+
+    return {
+        "success": True,
+        "rows_inserted": inserted_count,
+        "explanation": explanation
+    }
+
+def handle_batch_update_block(args: Dict[str, Any], task_memory: dict, debug_info: list) -> dict:
+    """
+    Update multiple rows in one call.
+    """
+    table_name = args.get("table_name","").strip()
+    rows_info = args.get("rows", [])
+    explanation = args.get("explanation","")
+
+    debug_info.append(f"[batch_update] table={table_name}, #rows={len(rows_info)}")
+
+    permission_mode = table_permissions.get(table_name, "ALWAYS_DENY")
+    user_permission = True
+
+    if permission_mode == "ALWAYS_DENY":
+        msg = f"[batch_update_block] => table '{table_name}' => ALWAYS_DENY"
+        debug_info.append(msg)
+        logger.warning(msg)
+        return {"error": msg}
+
+    updated_count = 0
+    error_msg = None
+    db = SessionLocal()
+    try:
+        for row_data in rows_info:
+            where_clause = row_data.get("where_clause","").strip()
+            columns = row_data.get("columns", [])
+            values = row_data.get("values", [])
+
+            if not where_clause.upper().startswith("WHERE"):
+                raise ValueError(f"Missing or invalid where_clause => {where_clause}")
+
+            if len(columns) != len(values):
+                raise ValueError(f"Mismatch => {columns} vs {values}")
+
+            set_clauses = []
+            for c, v in zip(columns, values):
+                set_clauses.append(f"{c}={quote_if_needed(v)}")
+            set_stmt = ", ".join(set_clauses)
+            sql_query = f"UPDATE {table_name} SET {set_stmt} {where_clause};"
+            debug_info.append(f"[batch_update] => {sql_query}")
+
+            result = db.execute(text(sql_query))
+            rowcount = result.rowcount or 0
+            updated_count += rowcount
+
+        db.commit()
+    except Exception as e:
+        error_msg = str(e)
+        debug_info.append(f"[batch_update_block] error => {error_msg}")
+        logger.warning(f"[batch_update_block] error => {error_msg}")
+        db.rollback()
+    finally:
+        db.close()
+
+    if error_msg:
+        return {"error": error_msg, "rows_affected": updated_count, "explanation": explanation}
+    return {
+        "success": True,
+        "rows_affected": updated_count,
+        "explanation": explanation
+    }
+
+def handle_batch_delete_block(args: Dict[str, Any], task_memory: dict, debug_info: list) -> dict:
+    """
+    Delete multiple rows in one call.
+    """
+    table_name = args.get("table_name", "").strip()
+    rows_info = args.get("rows", [])
+    explanation = args.get("explanation", "")
+
+    debug_info.append(f"[batch_delete_block] table={table_name}, #rows={len(rows_info)}")
+
+    permission_mode = table_permissions.get(table_name, "ALWAYS_DENY")
+    user_permission = True
+
+    if permission_mode == "ALWAYS_DENY":
+        msg = f"[batch_delete_block] => table '{table_name}' => ALWAYS_DENY"
+        debug_info.append(msg)
+        logger.warning(msg)
+        return {"error": msg}
+
+    deleted_count = 0
+    error_msg = None
+    db = SessionLocal()
+
+    try:
+        for row_data in rows_info:
+            where_clause = row_data.get("where_clause", "").strip()
+            if not where_clause.upper().startswith("WHERE"):
+                raise ValueError(f"Invalid where_clause => {where_clause}")
+
+            final_where = build_case_insensitive_where(where_clause)
+            sql_query = f"DELETE FROM {table_name} {final_where};"
+            debug_info.append(f"[batch_delete_block] => {sql_query}")
+
+            result = db.execute(text(sql_query))
+            rowcount = result.rowcount or 0
+            deleted_count += rowcount
+
+        db.commit()
+    except Exception as e:
+        error_msg = str(e)
+        debug_info.append(f"[batch_delete_block] error => {error_msg}")
+        logger.warning(f"[batch_delete_block] error => {error_msg}")
+        db.rollback()
+    finally:
+        db.close()
+
+    if error_msg:
+        return {"error": error_msg, "rows_affected": deleted_count, "explanation": explanation}
+
+    return {
+        "success": True,
+        "rows_affected": deleted_count,
+        "explanation": explanation
+    }
+
+###############################################################################
+# handle_output_block
+###############################################################################
+def handle_output_block(args: Dict[str, Any], task_memory: dict, debug_info: list) -> dict:
+    """
+    Final user-facing output. We look up recent_sql_result or parse_result
+    to see if there's an error or zero matches, etc.
+    """
+    llm_message = args.get("final_message", "").strip()
+    if not llm_message:
+        llm_message = "(No final_message provided)"
+
+    recent_sql = task_memory.get("recent_sql_result") or {}
+    sql_error = recent_sql.get("error", "")
+    row_affected = recent_sql.get("rows_affected", None)
+    row_count = recent_sql.get("rows_count", None)
+    rows_inserted = recent_sql.get("rows_inserted", None)
+
+    if sql_error:
+        final_msg = f"Sorry, an error occurred:\n{sql_error}"
+        debug_info.append("[output_block] Overriding due to SQL error.")
+        return {"final_answer": final_msg}
+
+    if rows_inserted is not None:
+        if rows_inserted == 0:
+            final_msg = "No rows inserted. Possibly mismatch."
+            return {"final_answer": final_msg}
+        else:
+            return {"final_answer": llm_message}
+
+    if row_affected is not None:
+        if row_affected == 0:
+            final_msg = "No matching items to update/delete."
+            return {"final_answer": final_msg}
+        else:
+            return {"final_answer": llm_message}
+
+    if row_count is not None:
+        if row_count == 0:
+            final_msg = "No matching items found."
+            return {"final_answer": final_msg}
+        else:
+            return {"final_answer": llm_message}
+
+    # If none matched, just return the message
+    return {"final_answer": llm_message}
+
+###############################################################################
+# handle_chat_block
+###############################################################################
+def handle_chat_block(args: Dict[str, Any], task_memory: dict, debug_info: list) -> dict:
+    """
+    The new chat_block that does open-ended reasoning or Q/A.
+    We feed user_prompt + optional context to OpenAI and store the result.
+    """
+    user_prompt = args.get("user_prompt", "")
+    context = args.get("context", "")
+    explanation = "Chat-based reasoning"
+
+    debug_info.append(f"[chat_block] user_prompt={user_prompt}, context={context}")
+
+    model_name = task_memory.get("agent_model", "gpt-4-0613")
+    client = openai.OpenAI(api_key=openai.api_key)
+
+    # Merge user_prompt + context into a single query:
+    chat_query = f"User Prompt: {user_prompt}\nContext: {context}\nRespond helpfully."
+
+    try:
+        resp = client.chat.completions.create(
+            model=model_name,
+            messages=[{"role": "user", "content": chat_query}],
+            temperature=0.7
+        )
+        choice = resp.choices[0]
+        final_text = choice.message.content.strip()
+        debug_info.append(f"[chat_block] LLM response => {final_text}")
+
+        return {
+            "success": True,
+            "response_text": final_text,
+            "explanation": explanation
+        }
+    except Exception as e:
+        error_msg = str(e)
+        debug_info.append(f"[chat_block] error => {error_msg}")
+        return {
+            "error": error_msg,
+            "success": False,
+            "response_text": "",
+            "explanation": explanation
+        }
+
+###############################################################################
+# handle_reflect_block (NEW)
+###############################################################################
+def handle_reflect_block(args: Dict[str, Any], task_memory: dict, debug_info: list) -> dict:
+    """
+    The reflect_block logic. This block sees the ENTIRE task memory, performs
+    a reflection or check, and may produce additional tasks to run OR finalize
+    with a user-facing message.
+    The schema for reflect_block includes:
+      - reasoning: str  (the chain-of-thought or reflection)
+      - final_message: Optional[str]  (if it wants to end)
+      - additional_tasks: Optional[List[PlanTaskItem]]  (if more steps are needed)
+    """
+    reasoning = args.get("reasoning", "")
+    final_msg = args.get("final_message", None)
+    additional_tasks = args.get("additional_tasks", None)
+
+    # We log the reflection
+    debug_info.append(f"[reflect_block] reasoning => {reasoning}")
+    if final_msg:
+        debug_info.append(f"[reflect_block] final_msg => {final_msg}")
+    if additional_tasks:
+        debug_info.append(f"[reflect_block] additional_tasks => {additional_tasks}")
+
+    # If final_msg is provided => we are concluding
+    # If additional_tasks is provided => we add them to the plan
+    # The orchestrator may do something with it.
+
+    # We'll store them so the orchestrator can read them
+    result_dict = {
+        "success": True,
+        "reasoning": reasoning,
+    }
+    if final_msg:
+        result_dict["final_message"] = final_msg
+    if additional_tasks:
+        result_dict["additional_tasks"] = additional_tasks
+
+    return result_dict
+
 --- orchestrator.py ---
-# agent/orchestrator.py
+# v0.2/backend/agent/orchestrator.py
 
 import json
 import os
@@ -23,14 +1178,16 @@ import openai
 
 from openai import OpenAI
 
-from .schemas import ALL_FUNCTION_SCHEMAS, PlanTasksArguments
+from .schemas import ALL_FUNCTION_SCHEMAS, PlanTasksArguments, PlanTaskItem
 from .blocks import (
     handle_parse_block,
     handle_sql_block,
     handle_output_block,
     handle_batch_insert_block,
     handle_batch_update_block,
-    handle_batch_delete_block,  # <-- also import the new delete handler
+    handle_batch_delete_block,
+    handle_chat_block,
+    handle_reflect_block  # (NEW) from blocks.py
 )
 from agent.global_store import TABLE_SCHEMAS, CURRENT_DATETIME_FN
 
@@ -40,6 +1197,8 @@ logger = logging.getLogger("agent")
 def call_openai_plan(user_request: str, debug_info: list, task_memory: dict) -> PlanTasksArguments:
     """
     Calls GPT with plan instructions to produce a short JSON plan { tasks: [...] }.
+    We read from plan_prompt.md for instructions, then let the LLM produce a plan
+    calling "name":"plan_tasks" with tasks[].
     """
     base_dir = os.path.dirname(os.path.abspath(__file__))
     plan_path = os.path.join(base_dir, "prompts", "plan_prompt.md")
@@ -101,154 +1260,102 @@ def call_openai_plan(user_request: str, debug_info: list, task_memory: dict) -> 
         return PlanTasksArguments(tasks=[])
 
 
+def _assemble_dynamic_schema_note() -> str:
+    """
+    Builds a text snippet enumerating all tables/columns
+    from TABLE_SCHEMAS. This is used inside each block's system prompt
+    so GPT sees the actual DB schema at runtime.
+    """
+    lines = ["Here is your DB schema:"]
+    for tbl, cols in TABLE_SCHEMAS.items():
+        col_str = ", ".join(cols)
+        lines.append(f"- {tbl}: [{col_str}]")
+    return "\n".join(lines)
+
+
 def build_system_prompt_for_block(block_name: str, block_description: str, task_memory: dict) -> str:
     """
-    Provide specialized instructions for each block.
-    Now also handle batch_insert_block, batch_update_block, and batch_delete_block
-    with short schema notes. And mention parse_block can parse DB rows if needed.
+    Provide specialized instructions for each block with some minimal context,
+    plus the dynamic DB schema.
     """
-    from agent.global_store import TABLE_SCHEMAS, CURRENT_DATETIME_FN
+    def minimal_parse_data():
+        subset = {}
+        subset["original_user_input"] = task_memory.get("original_user_input", "")
+        if "last_sql_rows" in task_memory:
+            subset["db_rows"] = task_memory["last_sql_rows"]
+        subset["target_table"] = task_memory.get("target_table", "")
+        return subset
+
+    def minimal_sql_data():
+        recent_parse = task_memory.get("recent_parse_result") or {}
+        subset = {}
+        if "parsed_item" in recent_parse:
+            subset["parsed_item"] = recent_parse["parsed_item"]
+        return subset
+
+    dynamic_schema_str = _assemble_dynamic_schema_note()
 
     if block_name == "parse_block":
-        user_req = task_memory.get("original_user_input", "")
-        date_str = ""
-        if CURRENT_DATETIME_FN:
-            dt_now = CURRENT_DATETIME_FN()
-            date_str = f"Current date/time => {dt_now.isoformat()}\n"
-
-        target_table = task_memory.get("target_table", "(none)")
-        table_cols = TABLE_SCHEMAS.get(target_table, [])
-        col_list_str = ", ".join(table_cols)
-
-        last_rows = task_memory.get("last_sql_rows", [])
-        last_rows_str = json.dumps(last_rows, default=str)
-
+        subset = minimal_parse_data()
         return (
-            "You are the 'parse_block'. You can parse or unify user text AND/OR data from the DB.\n"
-            "If 'db_rows' is provided, unify or fill columns. If user says '1 liter', parse quantity=1.0, unit='liter'.\n"
-            "If user says 'expires next week', convert to a date offset.\n"
-            "Return function_call => { raw_text:'...', explanation:'...', db_rows:..., parsed_item:{...} }.\n\n"
-            f"{date_str}"
-            f"Target table => {target_table}\n"
-            f"Columns => {col_list_str}\n"
-            f"last_sql_rows => {last_rows_str}\n"
-            f"user_input => {user_req}\n"
-            f"task_memory => {json.dumps(task_memory, default=str)}"
+            "You are 'parse_block'. You parse user text for item info, date phrases, etc.\n"
+            "You can consider 'original_user_input' if no raw_text or db_rows is provided.\n"
+            "Your goal is to fill potential missing info from the user request or db_rows and fill the parsed_item.\n"
+            f"{dynamic_schema_str}\n"
+            "Minimal parse inputs => " + json.dumps(subset, default=str)
         )
-
     elif block_name == "sql_block":
-        db_schema_str = (
-            "Here is your DB schema:\n"
-            "- fridge_items:\n"
-            "   columns => [id, name, quantity, unit, expiration_date, category] (ALWAYS_ALLOW)\n"
-            "- shopping_items:\n"
-            "   columns => [id, name, desired_quantity, unit, purchased] (ALWAYS_ALLOW)\n"
-            "- invoices:\n"
-            "   columns => [id, date, total_amount, store_name] (REQUIRE_USER)\n"
-            "- invoice_items:\n"
-            "   columns => [id, invoice_id, name, quantity, price_per_unit] (REQUIRE_USER)\n"
-            "- monthly_spendings:\n"
-            "   columns => [id, year_month, total_spent] (ALWAYS_DENY)\n"
-        )
+        subset = minimal_sql_data()
         return (
-            "You are 'sql_block'. You produce JSON => { table_name, columns, values, action_type, explanation, [where_clause] }.\n"
-            "If user says 'delete X', do DELETE with a proper where_clause.\n"
-            "If user says 'update X', do UPDATE with a proper where_clause.\n"
-            "You MUST always provide a where_clause if action_type=DELETE or UPDATE.\n\n"
-            + db_schema_str
-            + "\n"
-            + "task_memory => "
-            + json.dumps(task_memory, default=str)
+            "You are 'sql_block'. Produce JSON => "
+            "{ table_name, columns, values, action_type, explanation, [where_clause] }.\n"
+            + dynamic_schema_str
+            + "\nMinimal SQL inputs => " + json.dumps(subset, default=str)
         )
-
-    elif block_name == "output_block":
-        last_sql = task_memory.get("last_sql_block_result", {})
-        return (
-            "You are 'output_block'. Summarize or finalize the answer.\n"
-            "Override if rowcount=0 => say 'No items found or changed', or if there's an error.\n"
-            f"last_sql_block_result => {json.dumps(last_sql, default=str)}\n"
-            f"task_memory => {json.dumps(task_memory, default=str)}"
-        )
-
     elif block_name == "batch_insert_block":
-        db_schema_str = (
-            "Here is your DB schema:\n"
-            "- fridge_items:\n"
-            "   columns => [id, name, quantity, unit, expiration_date, category] (ALWAYS_ALLOW)\n"
-            "- shopping_items:\n"
-            "   columns => [id, name, desired_quantity, unit, purchased] (ALWAYS_ALLOW)\n"
-            "- invoices:\n"
-            "   columns => [id, date, total_amount, store_name] (REQUIRE_USER)\n"
-            "- invoice_items:\n"
-            "   columns => [id, invoice_id, name, quantity, price_per_unit] (REQUIRE_USER)\n"
-            "- monthly_spendings:\n"
-            "   columns => [id, year_month, total_spent] (ALWAYS_DENY)\n"
-        )
+        subset = minimal_sql_data()
         return (
-            "You are 'batch_insert_block'. You receive { table_name, rows:[{columns, values},...], explanation}.\n"
-            "Insert multiple rows into the DB.\n\n"
-            + db_schema_str
-            + "\n"
-            + "task_memory => "
-            + json.dumps(task_memory, default=str)
+            "You are 'batch_insert_block'. Insert multiple rows in one call.\n\n"
+            + dynamic_schema_str
+            + "\nMinimal batch_insert inputs => " + json.dumps(subset, default=str)
         )
-
     elif block_name == "batch_update_block":
-        db_schema_str = (
-            "Here is your DB schema:\n"
-            "- fridge_items:\n"
-            "   columns => [id, name, quantity, unit, expiration_date, category] (ALWAYS_ALLOW)\n"
-            "- shopping_items:\n"
-            "   columns => [id, name, desired_quantity, unit, purchased] (ALWAYS_ALLOW)\n"
-            "- invoices:\n"
-            "   columns => [id, date, total_amount, store_name] (REQUIRE_USER)\n"
-            "- invoice_items:\n"
-            "   columns => [id, invoice_id, name, quantity, price_per_unit] (REQUIRE_USER)\n"
-            "- monthly_spendings:\n"
-            "   columns => [id, year_month, total_spent] (ALWAYS_DENY)\n"
-        )
+        subset = minimal_sql_data()
         return (
-            "You are 'batch_update_block'. You receive { table_name, rows:[{where_clause, columns, values},...], explanation}.\n"
-            "Update multiple rows in a single call. If user says 'Update these items at once,' produce multiple row objects.\n\n"
-            + db_schema_str
-            + "\n"
-            + "task_memory => "
-            + json.dumps(task_memory, default=str)
+            "You are 'batch_update_block'. Update multiple rows in one call.\n"
+            "Provide {where_clause, columns, values} for each row.\n\n"
+            + dynamic_schema_str
+            + "\nMinimal batch_update inputs => " + json.dumps(subset, default=str)
         )
-
-    elif block_name == "batch_delete_block":  # <--- NEW
-        db_schema_str = (
-            "Here is your DB schema:\n"
-            "- fridge_items:\n"
-            "   columns => [id, name, quantity, unit, expiration_date, category] (ALWAYS_ALLOW)\n"
-            "- shopping_items:\n"
-            "   columns => [id, name, desired_quantity, unit, purchased] (ALWAYS_ALLOW)\n"
-            "- invoices:\n"
-            "   columns => [id, date, total_amount, store_name] (REQUIRE_USER)\n"
-            "- invoice_items:\n"
-            "   columns => [id, invoice_id, name, quantity, price_per_unit] (REQUIRE_USER)\n"
-            "- monthly_spendings:\n"
-            "   columns => [id, year_month, total_spent] (ALWAYS_DENY)\n"
-        )
+    elif block_name == "batch_delete_block":
         return (
-            "You are 'batch_delete_block'. You receive { table_name, rows:[{where_clause}], explanation}.\n"
-            "Delete multiple rows in a single call. If user says 'Remove these items at once,' produce multiple row objects.\n"
-            "Each object must have 'where_clause', e.g. WHERE id=7 or WHERE name='spinach'.\n\n"
-            + db_schema_str
-            + "\n"
-            + "task_memory => "
-            + json.dumps(task_memory, default=str)
+            "You are 'batch_delete_block'. Delete multiple rows in one call.\n\n"
+            + dynamic_schema_str
         )
-
+    elif block_name == "chat_block":
+        return (
+            "You are 'chat_block'. Perform open-ended conversation or reasoning.\n"
+            "Return JSON => {response_text}.\n\n"
+            + "You receive full task_memory => " + json.dumps(task_memory, default=str)
+        )
+    elif block_name == "output_block":
+        return (
+            "You are 'output_block'. Summarize or finalize the user-facing answer.\n\n"
+            + "You receive full task_memory => " + json.dumps(task_memory, default=str)
+        )
+    elif block_name == "reflect_block":
+        # We'll show the entire task_memory so the LLM can reflect on every step
+        return (
+            "You are 'reflect_block'. You see the entire task memory (all steps/outputs).\n"
+            "You can decide if more steps are needed or finalize with final_message.\n"
+            "Output JSON => {reasoning:'...', final_message:'...', additional_tasks:[{block:'...',...}] }.\n\n"
+            + "Full task_memory => " + json.dumps(task_memory, default=str)
+        )
     else:
-        return f"You are block={block_name}, partial memory => {json.dumps(task_memory, default=str)}"
+        return f"You are block={block_name}, minimal info => {json.dumps(task_memory, default=str)}"
 
 
 def call_block_llm(block_name: str, block_description: str, task_memory: dict, debug_info: list):
-    """
-    Calls GPT with the appropriate function schema.
-    Then dispatches to the matching handler: parse_block, sql_block, etc.
-    """
     logger.info(f"[call_block_llm] block={block_name}, desc={block_description}")
     debug_info.append(f"[block_llm] block={block_name}, desc={block_description}")
 
@@ -285,12 +1392,12 @@ def call_block_llm(block_name: str, block_description: str, task_memory: dict, d
     fn_call = choice.message.function_call
     if not fn_call:
         content_str = choice.message.content or ""
-        debug_info.append(f"[block_llm] no function_call => fallback parse content = {content_str}")
+        debug_info.append(f"[block_llm] no function_call => fallback parse = {content_str}")
         try:
             candidate = json.loads(content_str)
             if "name" in candidate and "arguments" in candidate:
                 fallback_args = candidate["arguments"]
-                logger.info(f"[call_block_llm] fallback parse => block={block_name}, arguments={fallback_args}")
+                logger.info(f"[call_block_llm] fallback parse => {fallback_args}")
                 return dispatch_block(block_name, fallback_args, task_memory, debug_info)
         except Exception as e:
             msg = f"No function_call returned, fallback parse error => {e}"
@@ -315,9 +1422,20 @@ def dispatch_block(block_name: str, args_data: dict, task_memory: dict, debug_in
     logger.info(f"[dispatch_block] block={block_name}, args={args_data}")
     debug_info.append(f"[dispatch_block] block={block_name}, args={args_data}")
 
-    # If the block is a DB-related batch or single SQL, set target_table from the arguments
+    step_index = len(task_memory.get("block_steps", []))
+    step_entry = {
+        "block_name": block_name,
+        "description": args_data.get("explanation", ""),
+        "inputs": args_data,
+        "outputs": {},
+        "step_index": step_index
+    }
+
+    # If we have a DB-related block, set target_table
     if ("table_name" in args_data
-        and block_name in ["sql_block","batch_insert_block","batch_update_block","batch_delete_block"]):
+        and block_name in [
+            "sql_block", "batch_insert_block", "batch_update_block", "batch_delete_block"
+        ]):
         guessed_table = args_data["table_name"]
         debug_info.append(f"[dispatch_block] Setting target_table => {guessed_table}")
         task_memory["target_table"] = guessed_table
@@ -329,49 +1447,109 @@ def dispatch_block(block_name: str, args_data: dict, task_memory: dict, debug_in
         handle_batch_insert_block,
         handle_batch_update_block,
         handle_batch_delete_block,
+        handle_chat_block,
+        handle_reflect_block
     )
 
     if block_name == "parse_block":
-        return handle_parse_block(args_data, task_memory, debug_info)
+        result = handle_parse_block(args_data, task_memory, debug_info)
+        step_entry["outputs"] = result
+        task_memory["recent_parse_result"] = result
     elif block_name == "sql_block":
-        return handle_sql_block(args_data, task_memory, debug_info)
-    elif block_name == "output_block":
-        return handle_output_block(args_data, task_memory, debug_info)
+        result = handle_sql_block(args_data, task_memory, debug_info)
+        step_entry["outputs"] = result
+        task_memory["recent_sql_result"] = result
     elif block_name == "batch_insert_block":
-        return handle_batch_insert_block(args_data, task_memory, debug_info)
+        result = handle_batch_insert_block(args_data, task_memory, debug_info)
+        step_entry["outputs"] = result
+        task_memory["recent_sql_result"] = result
     elif block_name == "batch_update_block":
-        return handle_batch_update_block(args_data, task_memory, debug_info)
-    elif block_name == "batch_delete_block":  # <-- NEW
-        return handle_batch_delete_block(args_data, task_memory, debug_info)
+        result = handle_batch_update_block(args_data, task_memory, debug_info)
+        step_entry["outputs"] = result
+        task_memory["recent_sql_result"] = result
+    elif block_name == "batch_delete_block":
+        result = handle_batch_delete_block(args_data, task_memory, debug_info)
+        step_entry["outputs"] = result
+        task_memory["recent_sql_result"] = result
+    elif block_name == "chat_block":
+        result = handle_chat_block(args_data, task_memory, debug_info)
+        step_entry["outputs"] = result
+        task_memory["recent_chat_result"] = result
+    elif block_name == "output_block":
+        result = handle_output_block(args_data, task_memory, debug_info)
+        step_entry["outputs"] = result
+    elif block_name == "reflect_block":
+        result = handle_reflect_block(args_data, task_memory, debug_info)
+        step_entry["outputs"] = result
+        # We store them so orchestrator can see if it has additional tasks:
+        task_memory["recent_reflect_result"] = result
     else:
         msg = f"Unrecognized block => {block_name}"
         debug_info.append(msg)
         logger.warning(msg)
+        step_entry["outputs"] = {"error": msg}
+        if "block_steps" not in task_memory:
+            task_memory["block_steps"] = []
+        task_memory["block_steps"].append(step_entry)
         return {"error": msg}
+
+    if "block_steps" not in task_memory:
+        task_memory["block_steps"] = []
+    task_memory["block_steps"].append(step_entry)
+    return step_entry["outputs"]
 
 
 def run_agent(user_input: str, initial_task_memory: dict = None):
     """
     Orchestrates the user request -> plan -> block calls -> final answer.
+
+    We ensure that reflect_block is always triggered last. If the plan
+    didn't include reflect_block, we forcibly add it. Then we run tasks in a loop
+    and see if reflect_block produces new tasks or a final_message.
     """
     debug_info = []
     if not initial_task_memory:
         initial_task_memory = {}
-    task_memory = {"original_user_input": user_input, **initial_task_memory}
 
+    task_memory = {
+        "original_user_input": user_input,
+        "block_steps": [],
+        "recent_parse_result": None,
+        "recent_sql_result": None,
+        "recent_chat_result": None,
+        "recent_reflect_result": None,
+        **initial_task_memory
+    }
+
+    # 1) Plan
     plan_result = call_openai_plan(user_input, debug_info, task_memory)
     if not plan_result.tasks:
         return ("Could not plan tasks. Possibly clarify your request.", debug_info)
 
-    final_answer = "(No final answer produced)"
-    output_block_triggered = False
+    # 1B) If reflect_block is not the last item, we forcibly add it:
+    if not plan_result.tasks or plan_result.tasks[-1].block != "reflect_block":
+        debug_info.append("[run_agent] forcibly adding reflect_block as final step")
+        plan_result.tasks.append(
+            PlanTaskItem(
+                block="reflect_block",
+                description="Auto-injected reflect step",
+                title="Reflection",
+                reasoning="Ensure final reflection"
+            )
+        )
 
-    # Execute each step in the plan
-    for step in plan_result.tasks:
+    # 2) Execute tasks in order (some might be newly appended by reflect_block)
+    final_answer = "(No final answer yet)"
+
+    tasks_list = plan_result.tasks
+    task_index = 0
+
+    while task_index < len(tasks_list):
+        step = tasks_list[task_index]
         block = step.block
         desc = step.description
 
-        # (Optional) guess table from step description, e.g. if it mentions "fridge_items"
+        # Heuristic for table guess
         if "fridge_items" in desc.lower():
             task_memory["target_table"] = "fridge_items"
         elif "shopping_list" in desc.lower() or "shopping_items" in desc.lower():
@@ -379,30 +1557,48 @@ def run_agent(user_input: str, initial_task_memory: dict = None):
         elif "invoice" in desc.lower():
             task_memory["target_table"] = "invoices"
 
+        # Call LLM block
         result = call_block_llm(block, desc, task_memory, debug_info)
-        task_memory[f"last_{block}_result"] = result
 
-        if block == "output_block":
-            output_block_triggered = True
-            # The output_block should produce either "final_answer" or "final_message"
-            if "final_answer" in result:
-                final_answer = result["final_answer"]
-            else:
-                fm = result.get("final_message", "")
-                if fm:
-                    final_answer = fm
-            break
+        if block == "reflect_block":
+            # The reflect block might produce final_message or additional tasks
+            reflect_res = task_memory.get("recent_reflect_result", {})
+            if "final_message" in reflect_res:
+                final_answer = reflect_res["final_message"]
+                debug_info.append(f"[run_agent] reflect_block produced final_message => {final_answer}")
+                break  # end loop
+            elif "additional_tasks" in reflect_res:
+                # Insert those tasks right after current step
+                new_tasks = reflect_res["additional_tasks"]
+                debug_info.append(f"[run_agent] reflect_block produced {len(new_tasks)} new tasks => {new_tasks}")
+                # Convert them to PlanTaskItem if needed:
+                for t in new_tasks:
+                    # We assume user might produce minimal keys in t
+                    if not isinstance(t, dict):
+                        continue
+                    block_name = t.get("block","")
+                    desc_str = t.get("description","(no description)")
+                    tasks_list.insert(task_index+1, PlanTaskItem(
+                        block=block_name,
+                        description=desc_str,
+                        title=t.get("title","(auto)"),
+                        reasoning=t.get("reasoning","(auto)"),
+                    ))
+                # do not break; continue to next step
+        task_index += 1
 
-    # Fallback if there's no output_block
-    if not output_block_triggered:
-        last_sql_res = task_memory.get("last_sql_block_result", {})
+    # If we finish all tasks without reflect_block finalizing:
+    if final_answer == "(No final answer yet)" and task_index >= len(tasks_list):
+        debug_info.append("[run_agent] reflect_block ended with no final_message => fallback logic")
+        # fallback if reflect didn't produce final_message
+        # e.g. we can say "No final message" or check last_sql_result:
+        last_sql_res = task_memory.get("recent_sql_result") or {}
         if "error" in last_sql_res:
             final_answer = "Sorry, an error occurred with your request:\n" + last_sql_res["error"]
         else:
             ra = last_sql_res.get("rows_affected", None)
             rc = last_sql_res.get("rows_count", None)
             rows_inserted = last_sql_res.get("rows_inserted", None)
-
             if rows_inserted is not None:
                 if rows_inserted == 0:
                     final_answer = "No rows were inserted (possible mismatch)."
@@ -419,601 +1615,12 @@ def run_agent(user_input: str, initial_task_memory: dict = None):
                 else:
                     final_answer = f"Found {rc} item(s)."
             else:
-                final_answer = "Operation completed, but no final output_block was produced."
+                final_answer = "Operation completed, but reflect_block gave no final_message."
 
     return (final_answer, debug_info)
 
---- blocks.py ---
-# agent/blocks.py
-
-import re
-import json
-import logging
-from typing import Any, Dict
-from database import SessionLocal, table_permissions
-from sqlalchemy import text
-import datetime
-
-logger = logging.getLogger("agent")
-
-NAME_SYNONYMS = {
-    "tomato": "tomatoes",
-    "tomatoe": "tomatoes",
-    "tomatoes": "tomatoes",
-    # ...
-}
-
-DATE_SYNONYMS = {
-    "today": 0,
-    "tomorrow": 1,
-    "next week": 7,
-    # ...
-}
-
-def dictionary_normalize_item_name(raw: str) -> str:
-    lowered = raw.strip().lower()
-    return NAME_SYNONYMS.get(lowered, lowered)
-
-def guess_quantity_and_unit_from_text(text: str) -> (float, str):
-    match = re.search(
-        r"(\d+(?:\.\d+)?)\s*(liter|liters|unit|units|bag|bags|piece|pieces)\b",
-        text,
-        re.IGNORECASE
-    )
-    if match:
-        qty_str = match.group(1)
-        unit_str = match.group(2)
-        try:
-            qty_val = float(qty_str)
-        except:
-            qty_val = 1.0
-        return (qty_val, unit_str.lower())
-    else:
-        return (None, None)
-
-def guess_expiration_date_from_text(text: str, current_dt_fn):
-    match = re.search(r"(expires|expiring|expiry)\s+(today|tomorrow|next week)\b", text, re.IGNORECASE)
-    if match:
-        phrase = match.group(2).lower()
-        offset_days = DATE_SYNONYMS.get(phrase, 0)
-        now_dt = current_dt_fn() if current_dt_fn else datetime.datetime.utcnow()
-        real_dt = now_dt + datetime.timedelta(days=offset_days)
-        return real_dt.strftime("%Y-%m-%d")
-    else:
-        return None
-
-
-def handle_parse_block(args: Dict[str, Any], task_memory: dict, debug_info: list) -> dict:
-    """
-    parse_block can parse raw_text from user, but also can unify 'db_rows' if provided.
-    We store the result in parsed_item or we can store additional logic.
-    """
-    raw_text = args.get("raw_text", "")
-    explanation = args.get("explanation", "")
-    parsed_item = args.get("parsed_item", {}) or {}
-
-    # Optionally, if we have db_rows in the parse_block arguments:
-    db_rows = args.get("db_rows", [])  # new field if you let LLM produce it
-
-    debug_info.append(f"[parse_block] raw_text={raw_text}, explanation={explanation}, #db_rows={len(db_rows)}")
-
-    from agent.global_store import TABLE_SCHEMAS, CURRENT_DATETIME_FN
-
-    # Possibly unify synonyms if 'name' in parsed_item
-    if "name" in parsed_item:
-        old_name = parsed_item["name"]
-        new_name = dictionary_normalize_item_name(old_name)
-        parsed_item["name"] = new_name
-        debug_info.append(f"[parse_block] Normalized name from '{old_name}' => '{new_name}'")
-
-    # If no 'quantity' or 'unit', guess from raw_text
-    if "quantity" not in parsed_item or "unit" not in parsed_item:
-        (qty_guess, unit_guess) = guess_quantity_and_unit_from_text(raw_text)
-        if qty_guess is not None and "quantity" not in parsed_item:
-            parsed_item["quantity"] = qty_guess
-        if unit_guess is not None and "unit" not in parsed_item:
-            parsed_item["unit"] = unit_guess
-
-    # If no expiration_date, guess from raw_text
-    if "expiration_date" not in parsed_item:
-        dt_guess = guess_expiration_date_from_text(raw_text, CURRENT_DATETIME_FN)
-        if dt_guess:
-            parsed_item["expiration_date"] = dt_guess
-
-    # If we want to unify partial DB data as well
-    # e.g. fill missing columns in each row, or something advanced.
-    # For now, we just store the db_rows in memory so the LLM knows it can use them.
-    # Or we can do more advanced logic here.
-    if db_rows:
-        debug_info.append(f"[parse_block] We also have {len(db_rows)} row(s) from the DB to parse/unify.")
-        # In a real scenario, you might unify each row with parsed_item
-        # or do some advanced merging logic. For now, we just keep them in memory:
-        task_memory["last_parsed_db_rows"] = db_rows
-
-    # Also fill missing columns if target_table is known
-    target_table = task_memory.get("target_table", "")
-    col_list = TABLE_SCHEMAS.get(target_table, [])
-    debug_info.append(f"[parse_block] target_table => {target_table}, col_list => {col_list}")
-
-    for c in col_list:
-        if c not in parsed_item:
-            if c == "quantity":
-                parsed_item[c] = 1.0
-            elif c == "unit":
-                parsed_item[c] = "unit"
-            elif c == "expiration_date":
-                parsed_item[c] = None
-            elif c == "category":
-                parsed_item[c] = "misc"
-
-    debug_info.append(f"[parse_block] final parsed_item => {parsed_item}")
-    task_memory["parsed_item"] = parsed_item
-
-    return {
-        "success": True,
-        "parsed_item": parsed_item,
-        "db_rows": db_rows,
-        "explanation": explanation
-    }
-
-
-def build_case_insensitive_where(where_str: str) -> str:
-    pattern = r"(?i)WHERE\s+name\s*=\s*([\"'])(.*?)\1"
-    replacement = r"WHERE LOWER(name)=LOWER(\1\2\1)"
-    out = re.sub(pattern, replacement, where_str)
-    return out
-
-def quote_if_needed(val: str) -> str:
-    # If val is None, treat it as "NULL" in SQL
-    if val is None:
-        return "NULL"
-
-    # else proceed
-    trimmed = val.strip()
-    # if numeric or already single-quoted => return as is
-    if (trimmed.startswith("'") and trimmed.endswith("'")) or trimmed.replace(".", "", 1).isdigit():
-        return trimmed
-
-    return f"'{trimmed}'"
-
-
-def handle_sql_block(args: Dict[str, Any], task_memory: dict, debug_info: list) -> dict:
-    """
-    The normal single SQL action: SELECT, INSERT, UPDATE, DELETE.
-    Potentially merges parse_block data into columns/values if action_type in [INSERT,UPDATE].
-    """
-    table_name = args.get("table_name", "").strip()
-    columns = args.get("columns", [])
-    values = args.get("values", [])
-    action_type = args.get("action_type", "").upper()
-    explanation = args.get("explanation", "")
-    where_clause = args.get("where_clause", "").strip()
-
-    debug_info.append(
-        f"[sql_block] user gave => table={table_name}, cols={columns}, vals={values}, "
-        f"action={action_type}, where={where_clause}"
-    )
-
-    parsed_item = task_memory.get("parsed_item", {})
-    if parsed_item and action_type in ["INSERT","UPDATE"]:
-        for col, val in parsed_item.items():
-            if col not in columns:
-                columns.append(col)
-                val_str = "NULL" if val is None else str(val)
-                values.append(val_str)
-        debug_info.append(f"[sql_block] after merging parse_item => columns={columns}, values={values}")
-
-    permission_mode = table_permissions.get(table_name, "ALWAYS_DENY")
-    user_permission = True
-
-    if action_type == "SELECT":
-        if permission_mode == "ALWAYS_DENY":
-            msg = f"[sql_block] SELECT on '{table_name}' => ALWAYS_DENY"
-            debug_info.append(msg)
-            logger.warning(msg)
-            return {"error": msg}
-
-        col_list_str = "*"
-        if columns:
-            col_list_str = ", ".join(columns)
-        sql_query = f"SELECT {col_list_str} FROM {table_name};"
-        return run_select_query(sql_query, explanation, debug_info, task_memory)
-
-    elif action_type == "INSERT":
-        if permission_mode == "ALWAYS_DENY":
-            msg = f"[sql_block] INSERT => table '{table_name}' => ALWAYS_DENY"
-            debug_info.append(msg)
-            return {"error": msg}
-
-        if len(columns) != len(values):
-            msg = f"[sql_block] Mismatch => columns={columns}, values={values}"
-            debug_info.append(msg)
-            return {"error": msg}
-
-        col_list_str = ", ".join(columns)
-        val_list_str = ", ".join(quote_if_needed(v) for v in values)
-        sql_query = f"INSERT INTO {table_name}({col_list_str}) VALUES({val_list_str});"
-        debug_info.append(f"[sql_block] final INSERT => {sql_query}")
-        return run_write_query(sql_query, explanation, debug_info)
-
-    elif action_type in ["UPDATE","DELETE"]:
-        if permission_mode == "ALWAYS_DENY":
-            msg = f"[sql_block] Writes to '{table_name}' => ALWAYS_DENY"
-            debug_info.append(msg)
-            logger.warning(msg)
-            return {"error": msg}
-
-        if permission_mode == "REQUIRE_USER" and not user_permission:
-            msg = f"[sql_block] Write to '{table_name}' => not granted"
-            debug_info.append(msg)
-            logger.warning(msg)
-            return {"error": msg}
-
-        if not where_clause.upper().startswith("WHERE"):
-            msg = f"[sql_block] {action_type} requested but no where_clause => not allowed!"
-            debug_info.append(msg)
-            logger.warning(msg)
-            return {"error": msg}
-
-        ci_where = build_case_insensitive_where(where_clause)
-        debug_info.append(f"[sql_block] transformed where => {ci_where}")
-        where_clause = ci_where
-
-        if action_type == "UPDATE":
-            if len(columns) != len(values):
-                msg = f"[sql_block] mismatch col vs val => {columns} vs {values}"
-                debug_info.append(msg)
-                return {"error": msg}
-            set_clauses = []
-            for c, v in zip(columns, values):
-                set_clauses.append(f"{c}={quote_if_needed(v)}")
-            set_stmt = ", ".join(set_clauses)
-            sql_query = f"UPDATE {table_name} SET {set_stmt} {where_clause};"
-            debug_info.append(f"[sql_block] final UPDATE => {sql_query}")
-            return run_write_query(sql_query, explanation, debug_info)
-
-        elif action_type == "DELETE":
-            sql_query = f"DELETE FROM {table_name} {where_clause};"
-            debug_info.append(f"[sql_block] final DELETE => {sql_query}")
-            return run_write_query(sql_query, explanation, debug_info)
-
-    else:
-        msg = f"[sql_block] unrecognized action_type={action_type}"
-        debug_info.append(msg)
-        return {"error": msg}
-
-
-def run_select_query(sql_query: str, explanation: str, debug_info: list, task_memory: dict) -> dict:
-    db = SessionLocal()
-    rows_data = []
-    error_msg = None
-    try:
-        debug_info.append(f"[sql_block] Running SELECT => {sql_query}")
-        result = db.execute(text(sql_query))
-        all_rows = result.fetchall()
-        for row in all_rows:
-            row_dict = dict(row._mapping)
-            rows_data.append(row_dict)
-        debug_info.append(f"[sql_block] SELECT => got {len(rows_data)} row(s)")
-        logger.info(f"[sql_block] success => SELECT '{sql_query}', rows={len(rows_data)}")
-    except Exception as e:
-        error_msg = str(e)
-        debug_info.append(f"[sql_block] select error => {error_msg}")
-        logger.warning(f"[sql_block] SELECT error => {error_msg}")
-    finally:
-        db.close()
-
-    if error_msg:
-        return {"error": error_msg, "sql_query": sql_query}
-    # Store the rows in memory so parse_block can read them
-    task_memory["last_sql_rows"] = rows_data
-    return {
-        "success": True,
-        "rows_data": rows_data,
-        "explanation": explanation,
-        "rows_count": len(rows_data)
-    }
-
-def run_write_query(sql_query: str, explanation: str, debug_info: list) -> dict:
-    db = SessionLocal()
-    error_msg = None
-    rowcount = 0
-    try:
-        debug_info.append(f"[sql_block] Running WRITE => {sql_query}")
-        result = db.execute(text(sql_query))
-        rowcount = result.rowcount or 0
-        db.commit()
-        debug_info.append(f"[sql_block] WRITE => rowcount={rowcount}")
-        logger.info(f"[sql_block] success => WRITE '{sql_query}', rowcount={rowcount}")
-    except Exception as e:
-        error_msg = str(e)
-        debug_info.append(f"[sql_block] write error => {error_msg}")
-        logger.warning(f"[sql_block] WRITE error => {error_msg}")
-        db.rollback()
-    finally:
-        db.close()
-
-    if error_msg:
-        return {"error": error_msg, "sql_query": sql_query}
-    return {
-        "success": True,
-        "rows_affected": rowcount,
-        "explanation": explanation
-    }
-
-def handle_batch_insert_block(args: Dict[str, Any], task_memory: dict, debug_info: list) -> dict:
-    """
-    Insert multiple rows into a table in one go.
-    """
-    table_name = args.get("table_name","").strip()
-    rows_info = args.get("rows", [])
-    explanation = args.get("explanation","")
-
-    debug_info.append(f"[batch_insert] table={table_name}, #rows={len(rows_info)}")
-
-    permission_mode = table_permissions.get(table_name, "ALWAYS_DENY")
-    user_permission = True
-
-    if permission_mode == "ALWAYS_DENY":
-        msg = f"[batch_insert_block] INSERT => table '{table_name}' => ALWAYS_DENY"
-        debug_info.append(msg)
-        logger.warning(msg)
-        return {"error": msg}
-
-    if permission_mode == "REQUIRE_USER" and not user_permission:
-        msg = f"[batch_insert_block] Write to '{table_name}' => not granted"
-        debug_info.append(msg)
-        logger.warning(msg)
-        return {"error": msg}
-
-    inserted_count = 0
-    error_msg = None
-    db = SessionLocal()
-    try:
-        for row_data in rows_info:
-            columns = row_data.get("columns", [])
-            values = row_data.get("values", [])
-
-            if len(columns) != len(values):
-                raise ValueError(f"Mismatch in columns vs. values => {columns} vs. {values}")
-
-            col_list_str = ", ".join(columns)
-            val_list_str = ", ".join(quote_if_needed(v) for v in values)
-            sql_query = f"INSERT INTO {table_name} ({col_list_str}) VALUES ({val_list_str});"
-            debug_info.append(f"[batch_insert] running => {sql_query}")
-
-            result = db.execute(text(sql_query))
-            rowcount = result.rowcount or 0
-            inserted_count += rowcount
-
-        db.commit()
-    except Exception as e:
-        error_msg = str(e)
-        debug_info.append(f"[batch_insert] error => {error_msg}")
-        logger.warning(f"[batch_insert_block] error => {error_msg}")
-        db.rollback()
-    finally:
-        db.close()
-
-    if error_msg:
-        return {"error": error_msg, "rows_inserted": inserted_count, "explanation": explanation}
-
-    return {
-        "success": True,
-        "rows_inserted": inserted_count,
-        "explanation": explanation
-    }
-
-def handle_batch_update_block(args: Dict[str, Any], task_memory: dict, debug_info: list) -> dict:
-    """
-    Similar to batch_insert_block, but for multiple UPDATE statements in one call.
-
-    {
-      "table_name": "fridge_items",
-      "rows": [
-        {
-          "where_clause": "WHERE id=5",
-          "columns": ["quantity","expiration_date"],
-          "values": ["3","2025-05-10"]
-        },
-        ...
-      ],
-      "explanation": "some reason"
-    }
-    """
-    table_name = args.get("table_name","").strip()
-    rows_info = args.get("rows", [])
-    explanation = args.get("explanation","")
-
-    debug_info.append(f"[batch_update] table={table_name}, #rows={len(rows_info)}")
-
-    permission_mode = table_permissions.get(table_name, "ALWAYS_DENY")
-    user_permission = True  # or some real check
-
-    if permission_mode == "ALWAYS_DENY":
-        msg = f"[batch_update_block] => table '{table_name}' => ALWAYS_DENY"
-        debug_info.append(msg)
-        logger.warning(msg)
-        return {"error": msg}
-
-    if permission_mode == "REQUIRE_USER" and not user_permission:
-        msg = f"[batch_update_block] => not granted for '{table_name}'"
-        debug_info.append(msg)
-        logger.warning(msg)
-        return {"error": msg}
-
-    updated_count = 0
-    error_msg = None
-    db = SessionLocal()
-    try:
-        for row_data in rows_info:
-            where_clause = row_data.get("where_clause","").strip()
-            columns = row_data.get("columns", [])
-            values = row_data.get("values", [])
-
-            if not where_clause.upper().startswith("WHERE"):
-                raise ValueError(f"Missing or invalid where_clause => {where_clause}")
-
-            if len(columns) != len(values):
-                raise ValueError(f"Mismatch => columns={columns}, values={values}")
-
-            set_clauses = []
-            for c, v in zip(columns, values):
-                set_clauses.append(f"{c}={quote_if_needed(v)}")
-            set_stmt = ", ".join(set_clauses)
-
-            sql_query = f"UPDATE {table_name} SET {set_stmt} {where_clause};"
-            debug_info.append(f"[batch_update] running => {sql_query}")
-
-            result = db.execute(text(sql_query))
-            rowcount = result.rowcount or 0
-            updated_count += rowcount
-
-        db.commit()
-    except Exception as e:
-        error_msg = str(e)
-        debug_info.append(f"[batch_update_block] error => {error_msg}")
-        logger.warning(f"[batch_update_block] error => {error_msg}")
-        db.rollback()
-    finally:
-        db.close()
-
-    if error_msg:
-        return {"error": error_msg, "rows_affected": updated_count, "explanation": explanation}
-
-    return {
-        "success": True,
-        "rows_affected": updated_count,
-        "explanation": explanation
-    }
-
-def handle_batch_delete_block(args: Dict[str, Any], task_memory: dict, debug_info: list) -> dict:
-    """
-    Delete multiple rows in a table in one go.
-
-    Example JSON:
-    {
-      "table_name": "fridge_items",
-      "rows": [
-        { "where_clause": "WHERE id=7" },
-        { "where_clause": "WHERE name='spinach'" }
-      ],
-      "explanation": "Remove multiple items at once"
-    }
-    """
-    table_name = args.get("table_name", "").strip()
-    rows_info = args.get("rows", [])
-    explanation = args.get("explanation", "")
-
-    debug_info.append(f"[batch_delete_block] table={table_name}, #rows={len(rows_info)}")
-
-    from database import table_permissions
-    permission_mode = table_permissions.get(table_name, "ALWAYS_DENY")
-    user_permission = True  # e.g. some real check eventually
-
-    if permission_mode == "ALWAYS_DENY":
-        msg = f"[batch_delete_block] => table '{table_name}' => ALWAYS_DENY"
-        debug_info.append(msg)
-        logger.warning(msg)
-        return {"error": msg}
-
-    if permission_mode == "REQUIRE_USER" and not user_permission:
-        msg = f"[batch_delete_block] => not granted for '{table_name}'"
-        debug_info.append(msg)
-        logger.warning(msg)
-        return {"error": msg}
-
-    deleted_count = 0
-    error_msg = None
-    db = SessionLocal()
-
-    try:
-        for row_data in rows_info:
-            where_clause = row_data.get("where_clause", "").strip()
-            if not where_clause.upper().startswith("WHERE"):
-                raise ValueError(f"Missing or invalid where_clause => {where_clause}")
-
-            # Optionally convert to case-insensitive if needed
-            final_where = build_case_insensitive_where(where_clause)
-
-            sql_query = f"DELETE FROM {table_name} {final_where};"
-            debug_info.append(f"[batch_delete_block] running => {sql_query}")
-
-            result = db.execute(text(sql_query))
-            rowcount = result.rowcount or 0
-            deleted_count += rowcount
-
-        db.commit()
-    except Exception as e:
-        error_msg = str(e)
-        debug_info.append(f"[batch_delete_block] error => {error_msg}")
-        logger.warning(f"[batch_delete_block] error => {error_msg}")
-        db.rollback()
-    finally:
-        db.close()
-
-    if error_msg:
-        return {"error": error_msg, "rows_affected": deleted_count, "explanation": explanation}
-
-    # re-use "rows_affected" so output_block logic can handle it
-    return {
-        "success": True,
-        "rows_affected": deleted_count,
-        "explanation": explanation
-    }
-
-
-def handle_output_block(args: Dict[str, Any], task_memory: dict, debug_info: list) -> dict:
-    llm_message = args.get("final_message", "").strip()
-    if not llm_message:
-        llm_message = "(No final_message provided by LLM)"
-
-    last_sql_result = task_memory.get("last_sql_block_result", {})
-    sql_error = last_sql_result.get("error", "")
-    row_affected = last_sql_result.get("rows_affected", None)
-    row_count = last_sql_result.get("rows_count", None)
-    rows_inserted = last_sql_result.get("rows_inserted", None)
-
-    if sql_error:
-        final_msg = f"Sorry, an error occurred with your request:\n{sql_error}"
-        debug_info.append("[output_block] Overriding LLM message due to SQL error.")
-        return {"final_answer": final_msg}
-
-    if rows_inserted is not None:
-        if rows_inserted == 0:
-            final_msg = "No rows were inserted. Possibly data mismatch or user canceled."
-            debug_info.append("[output_block] Overriding LLM => no rows inserted.")
-            return {"final_answer": final_msg}
-        else:
-            debug_info.append(f"[output_block] Inserted {rows_inserted} => letting LLM message stand.")
-            return {"final_answer": llm_message}
-
-    if row_affected is not None:
-        if row_affected == 0:
-            final_msg = (
-                "No matching items were found to update/delete. "
-                "If you expected a change, please check the name."
-            )
-            debug_info.append("[output_block] Overriding LLM => no row changed.")
-            return {"final_answer": final_msg}
-        else:
-            debug_info.append("[output_block] row_affected>0 => letting LLM message stand.")
-            return {"final_answer": llm_message}
-
-    if row_count is not None:
-        if row_count == 0:
-            final_msg = "No matching items found."
-            debug_info.append("[output_block] SELECT => 0 => overriding.")
-            return {"final_answer": final_msg}
-        else:
-            debug_info.append("[output_block] SELECT => letting LLM stand.")
-            return {"final_answer": llm_message}
-
-    debug_info.append("[output_block] letting LLM stand => no row_affected, row_count, or rows_inserted.")
-    return {"final_answer": llm_message}
-
 --- schemas.py ---
-# backend/agent/schemas.py
+# v0.2/backend/agent/schemas.py
 
 from typing import List, Optional, Literal, Any
 from pydantic import BaseModel
@@ -1039,16 +1646,17 @@ plan_tasks_schema = {
     "parameters": PlanTasksArguments.schema()
 }
 
+
 #
 # 2) sql_block
 #
 class SQLBlockArguments(BaseModel):
     table_name: str
     columns: List[str]  # e.g. ["name","quantity","unit","expiration_date","category"]
-    values: List[str]   # e.g. ["'Joghurt'","2","'unit'","'2025-01-25'","'dairy'"]
+    values: List[str]   # e.g. ["Joghurt","2","unit","2025-01-25","dairy"]
     action_type: Literal["SELECT", "INSERT", "UPDATE", "DELETE"]
     explanation: str = ""
-    where_clause: Optional[str] = None  # for updates/deletes
+    where_clause: Optional[str] = None
 
 sql_block_schema = {
     "name": "sql_block",
@@ -1074,15 +1682,13 @@ sql_block_schema = {
                 "enum": ["SELECT","INSERT","UPDATE","DELETE"]
             },
             "explanation": {"type": "string"},
-            "where_clause": {
-                "type": "string",
-                "description": "e.g. WHERE name='tomatoes'"
-            }
+            "where_clause": {"type": "string"}
         },
         "required": ["table_name","columns","values","action_type"],
         "additionalProperties": False
     }
 }
+
 
 #
 # 3) output_block
@@ -1097,14 +1703,14 @@ output_block_schema = {
         "type": "object",
         "properties": {
             "final_message": {
-                "type": "string",
-                "description": "User-facing text or summary"
+                "type": "string"
             }
         },
         "required": ["final_message"],
         "additionalProperties": False
     }
 }
+
 
 #
 # 4) parse_block
@@ -1113,7 +1719,6 @@ class ParseBlockArguments(BaseModel):
     raw_text: str
     explanation: Optional[str] = ""
     parsed_item: Optional[Any] = None
-    # NEW: allow the LLM to pass db_rows if it wants
     db_rows: Optional[List[Any]] = None
 
 parse_block_schema = {
@@ -1133,14 +1738,14 @@ parse_block_schema = {
             },
             "db_rows": {
                 "type": "array",
-                "items": {"type": "object"},
-                "description": "If we need to parse/fill data from a prior SELECT query"
+                "items": {"type": "object"}
             }
         },
         "required": ["raw_text"],
         "additionalProperties": False
     }
 }
+
 
 #
 # 5) batch_insert_block
@@ -1157,9 +1762,8 @@ class BatchInsertBlockArguments(BaseModel):
 batch_insert_block_schema = {
     "name": "batch_insert_block",
     "description": (
-        "Insert multiple rows into one table in a single call. "
-        "No disclaimers, only valid JSON. "
-        "If user says 'Add multiple items at once', produce an array of {columns, values}."
+        "Insert multiple rows in one table in a single call."
+        "No disclaimers, only valid JSON."
     ),
     "parameters": {
         "type": "object",
@@ -1189,8 +1793,12 @@ batch_insert_block_schema = {
     }
 }
 
+
+#
+# 6) batch_update_block
+#
 class BatchUpdateRow(BaseModel):
-    where_clause: str            # e.g. "WHERE id=6"
+    where_clause: str
     columns: List[str]
     values: List[str]
 
@@ -1202,25 +1810,18 @@ class BatchUpdateBlockArguments(BaseModel):
 batch_update_block_schema = {
     "name": "batch_update_block",
     "description": (
-        "Update multiple rows in one table in a single call. "
-        "If user says 'Update multiple fridge items at once', produce an array of row updates."
+        "Update multiple rows in one table in a single call."
     ),
     "parameters": {
         "type": "object",
         "properties": {
-            "table_name": {
-                "type": "string",
-                "description": "e.g. 'fridge_items'"
-            },
+            "table_name": {"type": "string"},
             "rows": {
                 "type": "array",
                 "items": {
                     "type": "object",
                     "properties": {
-                        "where_clause": {
-                            "type": "string",
-                            "description": "WHERE clause, e.g. 'WHERE id=7'"
-                        },
+                        "where_clause": {"type": "string"},
                         "columns": {
                             "type": "array",
                             "items": {"type": "string"}
@@ -1231,99 +1832,126 @@ batch_update_block_schema = {
                         }
                     },
                     "required": ["where_clause","columns","values"]
-                },
-                "description": "List of row-level updates"
+                }
             },
-            "explanation": {
-                "type": "string",
-                "description": "Reasoning or comment about these updates"
-            }
+            "explanation": {"type": "string"}
         },
         "required": ["table_name","rows"],
         "additionalProperties": False
     }
 }
 
+
+#
+# 7) batch_delete_block
+#
 class BatchDeleteRow(BaseModel):
-    where_clause: str  # e.g. "WHERE id=5" or "WHERE name='spinach'"
+    where_clause: str
 
 class BatchDeleteBlockArguments(BaseModel):
     table_name: str
-    rows: List[BatchDeleteRow]  # each row just has a where_clause
+    rows: List[BatchDeleteRow]
     explanation: str = ""
 
 batch_delete_block_schema = {
     "name": "batch_delete_block",
     "description": (
-        "Delete multiple rows from one table in a single call. "
-        "If user says 'Remove these 5 items at once,' produce something like:\n"
-        "{\n"
-        '  "table_name": "fridge_items",\n'
-        '  "rows": [\n'
-        '     {"where_clause":"WHERE id=7"},\n'
-        '     {"where_clause":"WHERE name=\'spinach\'"}\n'
-        '   ],\n'
-        '  "explanation":"Deleting multiple items at once."\n'
-        '}'
+        "Delete multiple rows from one table in a single call."
     ),
     "parameters": {
         "type": "object",
         "properties": {
-            "table_name": {
-                "type": "string",
-                "description": "The DB table to delete from, e.g. 'fridge_items'"
-            },
+            "table_name": {"type": "string"},
             "rows": {
                 "type": "array",
                 "items": {
                     "type": "object",
                     "properties": {
-                        "where_clause": {
-                            "type": "string",
-                            "description": "WHERE clause, e.g. 'WHERE name=\\'spinach\\''"
-                        }
+                        "where_clause": {"type": "string"}
                     },
                     "required": ["where_clause"]
-                },
-                "description": "List of row-level deletes"
+                }
             },
-            "explanation": {
-                "type": "string",
-                "description": "Reason or comment about these deletions"
-            }
+            "explanation": {"type": "string"}
         },
         "required": ["table_name","rows"],
         "additionalProperties": False
     }
 }
 
+
+#
+# 8) chat_block
+#
 class ChatBlockArguments(BaseModel):
-    user_prompt: str                 # The question or text the user (or system) wants to feed into chat
-    context: Optional[str] = None    # If we have an optional large context
+    user_prompt: str
+    context: Optional[str] = None
 
 chat_block_schema = {
     "name": "chat_block",
     "description": (
         "Perform an open-ended chat or reasoning step. "
         "We supply 'user_prompt' plus optional 'context'. "
-        "In response, produce text in 'response_text' if needed."
+        "Return { response_text:'...' }."
     ),
     "parameters": {
         "type": "object",
         "properties": {
-            "user_prompt": {
-                "type": "string",
-                "description": "The user or system query we want to chat or reason about"
-            },
-            "context": {
-                "type": "string",
-                "description": "Optional large context or relevant background we want to feed the model"
-            }
+            "user_prompt": {"type": "string"},
+            "context": {"type": "string"}
         },
         "required": ["user_prompt"],
         "additionalProperties": False
     }
 }
+
+
+#
+# 9) reflect_block (NEW)
+#
+class ReflectBlockArguments(BaseModel):
+    reasoning: str
+    final_message: Optional[str] = None
+    additional_tasks: Optional[List[PlanTaskItem]] = None
+
+reflect_block_schema = {
+    "name": "reflect_block",
+    "description": (
+        "Reflect on the entire task memory. "
+        "You can optionally provide a final_message to end, "
+        "or additional_tasks if more steps are needed."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "reasoning": {
+                "type": "string",
+                "description": "Your chain-of-thought or reflection"
+            },
+            "final_message": {
+                "type": "string",
+                "description": "Optional user-facing text to finalize if done"
+            },
+            "additional_tasks": {
+                "type": "array",
+                "description": "Optional new tasks to add if more steps are needed",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "block": {"type": "string"},
+                        "description": {"type": "string"},
+                        "title": {"type": "string"},
+                        "reasoning": {"type": "string"}
+                    },
+                    "required": ["block","description","title","reasoning"]
+                }
+            }
+        },
+        "required": ["reasoning"],
+        "additionalProperties": False
+    }
+}
+
 
 ALL_FUNCTION_SCHEMAS = [
     plan_tasks_schema,
@@ -1333,179 +1961,973 @@ ALL_FUNCTION_SCHEMAS = [
     batch_insert_block_schema,
     batch_update_block_schema,
     batch_delete_block_schema,
-    chat_block_schema
+    chat_block_schema,
+    reflect_block_schema  # <-- newly added
 ]
 
---- plan_prompt.md ---
-You are an **AI Orchestrator**. Your job is to **produce exactly one JSON object** in the following shape:
+--- App.tsx ---
+// frontend/App.tsx
+import React from 'react';
+import { NavigationContainer } from '@react-navigation/native';
+import { createNativeStackNavigator } from '@react-navigation/native-stack';
 
-```json
-{
-  "name": "plan_tasks",
-  "arguments": {
-    "tasks": [
-      {
-        "block": "...",
-        "description": "...",
-        "title": "...",
-        "reasoning": "..."
-      },
-      ...
-    ]
+import { ModelProvider } from './ModelContext';
+import HomeScreen from './screens/HomeScreen';
+import SettingsScreen from './screens/SettingsScreen';
+
+const Stack = createNativeStackNavigator();
+
+function App() {
+  return (
+    <ModelProvider>
+      <NavigationContainer>
+        <Stack.Navigator>
+          <Stack.Screen
+            name="Home"
+            component={HomeScreen}
+            options={{headerShown: false}}
+          />
+          <Stack.Screen name="Settings" component={SettingsScreen} />
+        </Stack.Navigator>
+      </NavigationContainer>
+    </ModelProvider>
+  );
+}
+
+export default App;
+--- HomeScreen.tsx ---
+// frontend/screens/HomeScreen.tsx
+
+import React, { useState, useEffect, useContext } from 'react';
+import {
+  View,
+  PermissionsAndroid,
+  StyleSheet,
+  TouchableOpacity,
+  TextInput,
+  FlatList,
+  Text,
+  Image,
+  Modal,
+} from 'react-native';
+import MaterialCommunityIcons from 'react-native-vector-icons/MaterialCommunityIcons';
+import Tts from 'react-native-tts';
+import AudioRecord from 'react-native-audio-record';
+import axios from 'axios';
+
+import {
+  launchCamera,
+  launchImageLibrary,
+  Asset,
+} from 'react-native-image-picker';
+import DocumentPicker, { types } from 'react-native-document-picker';
+
+import { ModelContext } from '../ModelContext';
+
+// --------------------------------------
+// BACKEND ENDPOINTS
+// --------------------------------------
+const BACKEND_URL = 'http://192.168.0.189:8000';
+const BACKEND_TRANSCRIBE_URL = `${BACKEND_URL}/api/transcribe`;
+const BACKEND_CHAT_URL = `${BACKEND_URL}/api/chat`;
+const BACKEND_INGEST_URL = `${BACKEND_URL}/api/ingest`;
+const BACKEND_IMAGE_RECOGNIZE_URL = `${BACKEND_URL}/api/image_recognize`;
+const BACKEND_HISTORY_URL = `${BACKEND_URL}/api/history`;
+
+// NEW: Agent endpoint
+const BACKEND_AGENT_URL = `${BACKEND_URL}/api/agent`;
+
+// --------------------------------------
+// HomeScreen
+// --------------------------------------
+function HomeScreen({ navigation }: any) {
+  const { textModel, imageModel, whisperModel } = useContext(ModelContext);
+
+  // Chat messages
+  const [messages, setMessages] = useState<any[]>([]);
+  // Recording state
+  const [recording, setRecording] = useState(false);
+
+  // If the user picks an image
+  const [selectedImageUri, setSelectedImageUri] = useState<string | null>(null);
+  // If the user picks a doc
+  const [selectedDoc, setSelectedDoc] = useState<{
+    uri: string;
+    name: string;
+    type: string;
+  } | null>(null);
+
+  // Typed text input
+  const [textMessage, setTextMessage] = useState('');
+  // Speaker toggle
+  const [speakerOn, setSpeakerOn] = useState(false);
+
+  // Attach menu toggle
+  const [showAttachMenu, setShowAttachMenu] = useState(false);
+
+  // Tasks & errors for status popup
+  const [tasksInProgress, setTasksInProgress] = useState<string[]>([]);
+  const [errors, setErrors] = useState<string[]>([]);
+  const [showStatusPopup, setShowStatusPopup] = useState(false);
+
+  // --------------------------------------
+  // On mount: fetch chat history
+  // --------------------------------------
+  useEffect(() => {
+    MaterialCommunityIcons.loadFont();
+    fetchHistory();
+  }, []);
+
+  async function fetchHistory() {
+    try {
+      console.log('Fetching chat history...');
+      const resp = await axios.get(BACKEND_HISTORY_URL);
+      const { history } = resp.data;
+      const loaded: any[] = [];
+
+      history.forEach((ex: any) => {
+        // user text
+        if (ex.user_message && ex.user_message.trim()) {
+          loaded.push({
+            id: ex.id + '-user-text',
+            role: 'user',
+            type: 'text',
+            content: ex.user_message.trim(),
+          });
+        }
+        // user image
+        if (ex.user_image_b64) {
+          loaded.push({
+            id: ex.id + '-user-img',
+            role: 'user',
+            type: 'image',
+            content: `data:image/jpeg;base64,${ex.user_image_b64}`,
+          });
+        }
+        // image title
+        if (ex.image_title && ex.image_title.trim()) {
+          loaded.push({
+            id: ex.id + '-imgtitle',
+            role: 'app',
+            type: 'text',
+            content: `<Title>${ex.image_title.trim()}</Title>`,
+          });
+        }
+        // image description
+        if (ex.image_description && ex.image_description.trim()) {
+          loaded.push({
+            id: ex.id + '-imgdesc',
+            role: 'app',
+            type: 'text',
+            content: `<Description>${ex.image_description.trim()}</Description>`,
+          });
+        }
+        // assistant text
+        if (ex.llm_response && ex.llm_response.trim()) {
+          loaded.push({
+            id: ex.id + '-assistant',
+            role: 'app',
+            type: 'text',
+            content: ex.llm_response.trim(),
+          });
+        }
+      });
+
+      setMessages(loaded);
+      console.log('History loaded, total items:', loaded.length);
+    } catch (err) {
+      console.log('Error fetching history:', err);
+      addError(`Fetch history failed: ${err?.message || '(Network error)'}`);
+    }
   }
-}
-No additional top-level JSON or text is allowed—only this single "plan_tasks" JSON object.
 
-Tasks Array
-Inside "arguments": { "tasks": [...] }, each element is a step with:
-{
-  "block": "<block_name>",
-  "description": "<short explanation>",
-  "title": "<short label>",
-  "reasoning": "<brief reasoning>"
-}
-The final item in "tasks" must be {"block":"output_block", ...} with a "final_message":"...".
-
-Blocks You Can Use:
-1) sql_block
-
-Purpose: Execute a single SQL query.
-Must produce "table_name", "columns", "values", "action_type", "explanation".
-Allowed action_type: "SELECT" | "INSERT" | "UPDATE" | "DELETE".
-For the table fridge_items, valid columns are exactly [ "name", "quantity", "unit", "expiration_date", "category" ].
-No disclaimers or code blocks; only JSON with "name":"sql_block".
-2) parse_block
-
-Purpose: Parse or unify user text and/or DB data into a more structured form.
-Important: This does not do database changes. It only prepares data for a later step.
-If the user’s request wants to physically change the DB, you must eventually produce sql_block or batch_update_block or batch_delete_block after parse_block. Don’t end on parse_block alone.
-3) batch_insert_block
-
-Purpose: Insert multiple rows in a single call.
-For example:
-{
-  "name": "batch_insert_block",
-  "arguments": {
-    "table_name": "fridge_items",
-    "rows": [
-      { "columns": ["name","quantity"], "values": ["milk","2"] },
-      { "columns": ["name","quantity"], "values": ["eggs","12"] }
-    ],
-    "explanation": "Multiple inserts"
+  // --------------------------------------
+  // Task & error helpers
+  // --------------------------------------
+  function addTask(label: string) {
+    setTasksInProgress((prev) => [...prev, label]);
+    console.log('>>> addTask:', label);
   }
-}
+  function removeTask(label: string) {
+    setTasksInProgress((prev) => prev.filter((t) => t !== label));
+    console.log('>>> removeTask:', label);
+  }
+  function addError(msg: string) {
+    setErrors((prev) => [...prev, msg]);
+    console.log('>>> addError:', msg);
+  }
+  function clearErrors() {
+    setErrors([]);
+  }
+  function toggleStatusPopup() {
+    setShowStatusPopup(!showStatusPopup);
+  }
+  function getStatusButtonStyle() {
+    if (errors.length > 0) {
+      return { backgroundColor: 'red' };
+    } else if (tasksInProgress.length > 0) {
+      return { backgroundColor: 'blue' };
+    }
+    return { backgroundColor: '#555' };
+  }
+  function getStatusButtonIconName() {
+    if (errors.length > 0) {
+      return 'alert-circle';
+    } else if (tasksInProgress.length > 0) {
+      return 'progress-clock';
+    }
+    return 'information-outline';
+  }
 
-4) batch_update_block
-
-Purpose: Update multiple rows in a single call.
-If the user wants to physically change existing rows, produce a batch_update_block with where_clause for each row, for example:
-{
-  "name": "batch_update_block",
-  "arguments": {
-    "table_name": "fridge_items",
-    "rows": [
+  // --------------------------------------
+  // AUDIO RECORDING
+  // --------------------------------------
+  async function requestPermissions() {
+    try {
+      await PermissionsAndroid.requestMultiple([
+        PermissionsAndroid.PERMISSIONS.RECORD_AUDIO,
+        PermissionsAndroid.PERMISSIONS.WRITE_EXTERNAL_STORAGE,
+      ]);
+    } catch (err) {
+      console.warn(err);
+    }
+  }
+  async function requestCameraPermission() {
+    const granted = await PermissionsAndroid.request(
+      PermissionsAndroid.PERMISSIONS.CAMERA,
       {
-        "where_clause": "WHERE id=6",
-        "columns": ["quantity","expiration_date"],
-        "values": ["4","2025-07-01"]
-      },
-      {
-        "where_clause": "WHERE id=7",
-        "columns": ["quantity"],
-        "values": ["2"]
+        title: 'Camera Permission',
+        message: 'App needs camera access',
+        buttonNeutral: 'Ask Me Later',
+        buttonNegative: 'Cancel',
+        buttonPositive: 'OK',
       }
-    ],
-    "explanation": "Bulk update"
+    );
+    return granted === PermissionsAndroid.RESULTS.GRANTED;
   }
-}
-No disclaimers. Provide each row’s where_clause, columns, and values.
 
-5) batch_delete_block
+  const startRecording = async () => {
+    await requestPermissions();
+    AudioRecord.init({
+      sampleRate: 16000,
+      channels: 1,
+      bitsPerSample: 16,
+    });
+    AudioRecord.start();
+    setRecording(true);
+  };
 
-Purpose: Delete multiple rows in a single call.
-E.g.:
-{
-  "name": "batch_delete_block",
-  "arguments": {
-    "table_name": "fridge_items",
-    "rows": [
-      { "where_clause": "WHERE id=7" },
-      { "where_clause": "WHERE name='spinach'" }
-    ],
-    "explanation": "Deleting multiple items"
+  const stopRecording = async () => {
+    const filePath = await AudioRecord.stop();
+    setRecording(false);
+
+    addTask('Transcription');
+    try {
+      const formData = new FormData();
+      formData.append('whisper_model', whisperModel);
+      formData.append('file', {
+        uri: 'file://' + filePath,
+        name: 'audio.wav',
+        type: 'audio/wav',
+      } as any);
+
+      const resp = await axios.post(BACKEND_TRANSCRIBE_URL, formData, {
+        headers: { 'Content-Type': 'multipart/form-data' },
+      });
+      removeTask('Transcription');
+
+      const transcript = resp.data.transcript || '';
+      setTextMessage(transcript);
+    } catch (error: any) {
+      removeTask('Transcription');
+      const msg = error?.message || '(Network error)';
+      addError(`Transcription failed: ${msg}`);
+      console.log('Error transcribing audio:', error);
+    }
+  };
+
+  // --------------------------------------
+  // ATTACH MENU
+  // --------------------------------------
+  function toggleAttachMenu() {
+    setShowAttachMenu(!showAttachMenu);
   }
-}
 
-No disclaimers. Provide each row’s where_clause as needed.
-
-6) output_block
-
-Purpose: Provide the user-facing conclusion.
-Must have {"final_message":"some text"}.
-Always the final step in your "tasks" array.
-
-Key Constraints:
-Exactly one JSON object with "name":"plan_tasks" at top-level.
-Inside: "arguments":{ "tasks":[...] }.
-The final item in tasks must be {"block": "output_block", ...} with "final_message":"...".
-If user’s request implies physically changing or removing items in the DB, do not finish with parse_block alone. You must produce an actual write step:
-sql_block with "action_type":"UPDATE" or "action_type":"DELETE",
-or batch_update_block,
-or batch_delete_block.
-Then finalize with output_block.
-
-Remember:
-parse_block is purely for reformatting or clarifying data. It does no actual database changes.
-For changes, you need a sql_block or batch_..._block.
-
-Available Table Names:
-fridge_items
-shopping_items
-invoices
-invoice_items
-monthly_spendings
-
-Example of a Multi-Step Plan:
-{
-  "name": "plan_tasks",
-  "arguments": {
-    "tasks": [
-      {
-        "block": "sql_block",
-        "description": "Select from fridge_items",
-        "title": "Query fridge",
-        "reasoning": "We need existing rows"
-      },
-      {
-        "block": "parse_block",
-        "description": "Analyze retrieved data to find missing columns",
-        "title": "Parse for missing data",
-        "reasoning": "We unify or fill columns in memory"
-      },
-      {
-        "block": "batch_update_block",
-        "description": "Fix missing columns in fridge_items",
-        "title": "Batch update fridge",
-        "reasoning": "Apply the changes we decided on"
-      },
-      {
-        "block": "output_block",
-        "description": "Final user answer",
-        "title": "Show result",
-        "reasoning": "We provide final user-facing text"
+  // --------------------------------------
+  // CAMERA / GALLERY / DOC
+  // --------------------------------------
+  const handleTakePhoto = async () => {
+    toggleAttachMenu();
+    const hasCam = await requestCameraPermission();
+    if (!hasCam) {
+      console.log('Camera permission denied');
+      return;
+    }
+    const result = await launchCamera({ mediaType: 'photo' });
+    if (!result.didCancel && !result.errorCode && result.assets?.length) {
+      const asset: Asset = result.assets[0];
+      if (asset.uri) {
+        setSelectedImageUri(asset.uri);
       }
-    ]
+    }
+  };
+
+  const handleChooseFromGallery = async () => {
+    toggleAttachMenu();
+    const result = await launchImageLibrary({ mediaType: 'photo' });
+    if (!result.didCancel && !result.errorCode && result.assets?.length) {
+      const asset: Asset = result.assets[0];
+      if (asset.uri) {
+        setSelectedImageUri(asset.uri);
+      }
+    }
+  };
+
+  const handlePickDoc = async () => {
+    toggleAttachMenu();
+    try {
+      const res = await DocumentPicker.pickSingle({
+        presentationStyle: 'fullScreen',
+        type: [types.pdf, types.docx, types.plainText],
+      });
+      console.log('Picked doc:', res);
+      if (res.uri) {
+        setSelectedDoc({
+          uri: res.uri,
+          name: res.name ?? 'unnamed',
+          type: res.type ?? 'application/octet-stream',
+        });
+      }
+    } catch (err) {
+      if (DocumentPicker.isCancel(err)) {
+        console.log('User canceled doc picker');
+      } else {
+        console.log('Document pick error:', err);
+      }
+    }
+  };
+
+  // --------------------------------------
+  // Normal Chat / Doc / Image
+  // --------------------------------------
+  const sendMessage = async () => {
+    // 1) If doc
+    if (selectedDoc) {
+      addTask('Doc Ingestion');
+      try {
+        const formData = new FormData();
+        formData.append('file', {
+          uri: selectedDoc.uri,
+          type: selectedDoc.type,
+          name: selectedDoc.name,
+        } as any);
+        formData.append('description', textMessage);
+
+        const resp = await axios.post(BACKEND_INGEST_URL, formData, {
+          headers: { 'Content-Type': 'multipart/form-data' },
+        });
+        removeTask('Doc Ingestion');
+
+        console.log('Doc ingestion resp:', resp.data);
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: `doc-ingest-${Date.now()}`,
+            role: 'app',
+            type: 'text',
+            content: `Doc Ingested => ID=${resp.data.doc_id}, Desc="${resp.data.description}"`,
+          },
+        ]);
+      } catch (error: any) {
+        removeTask('Doc Ingestion');
+        const msg = error?.message || '(Network error)';
+        addError(`Doc ingestion failed: ${msg}`);
+        console.log('Error ingesting doc:', error);
+      }
+      setSelectedDoc(null);
+      setTextMessage('');
+      return;
+    }
+
+    // 2) If image => /api/image_recognize
+    if (selectedImageUri) {
+      const trimmed = textMessage.trim();
+      if (trimmed) {
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: `user-txt-${Date.now()}`,
+            role: 'user',
+            type: 'text',
+            content: trimmed,
+          },
+          {
+            id: `user-img-${Date.now()}`,
+            role: 'user',
+            type: 'image',
+            content: selectedImageUri,
+          },
+        ]);
+      } else {
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: `user-img-${Date.now()}`,
+            role: 'user',
+            type: 'image',
+            content: selectedImageUri,
+          },
+        ]);
+      }
+
+      addTask('Image Recognition');
+      try {
+        const formData = new FormData();
+        formData.append('file', {
+          uri: selectedImageUri,
+          type: 'image/jpeg',
+          name: 'photo.jpg',
+        } as any);
+        formData.append('user_prompt', trimmed);
+        formData.append('model', imageModel);
+
+        const resp = await axios.post(BACKEND_IMAGE_RECOGNIZE_URL, formData, {
+          headers: { 'Content-Type': 'multipart/form-data' },
+        });
+        removeTask('Image Recognition');
+
+        const { title, description, response } = resp.data || {};
+        console.log('image_recognize resp:', resp.data);
+
+        if (title && title.trim()) {
+          setMessages((prev) => [
+            ...prev,
+            {
+              id: `app-imgtitle-${Date.now()}`,
+              role: 'app',
+              type: 'text',
+              content: `<Title>${title}</Title>`,
+            },
+          ]);
+        }
+        if (description && description.trim()) {
+          setMessages((prev) => [
+            ...prev,
+            {
+              id: `app-imgdesc-${Date.now()}`,
+              role: 'app',
+              type: 'text',
+              content: `<Description>${description}</Description>`,
+            },
+          ]);
+        }
+        const finalResp = response || '(No response)';
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: `app-imgresp-${Date.now()}`,
+            role: 'app',
+            type: 'text',
+            content: `<Response>${finalResp}</Response>`,
+          },
+        ]);
+        if (speakerOn) {
+          Tts.speak(finalResp);
+        }
+      } catch (error: any) {
+        removeTask('Image Recognition');
+        const msg = error?.message || '(Network error)';
+        addError(`Image recognition failed: ${msg}`);
+        console.log('Error sending image:', error);
+      }
+      setSelectedImageUri(null);
+      setTextMessage('');
+      return;
+    }
+
+    // 3) Else => normal text => /api/chat
+    const trimmed = textMessage.trim();
+    if (!trimmed) return;
+
+    const userMsgId = `user-msg-${Date.now()}`;
+    setMessages((prev) => [
+      ...prev,
+      { id: userMsgId, role: 'user', type: 'text', content: trimmed },
+    ]);
+
+    addTask('Chat Request');
+    try {
+      const formData = new FormData();
+      formData.append('model', textModel);
+      formData.append('message', trimmed);
+
+      setTextMessage('');
+
+      const resp = await axios.post(BACKEND_CHAT_URL, formData, {
+        headers: { 'Content-Type': 'multipart/form-data' },
+      });
+      removeTask('Chat Request');
+
+      const reply = resp.data.response || '(No response)';
+      if (speakerOn) Tts.speak(reply);
+      setMessages((prev) => [
+        ...prev,
+        { id: `app-msg-${Date.now()}`, role: 'app', type: 'text', content: reply },
+      ]);
+    } catch (error: any) {
+      removeTask('Chat Request');
+      const msg = error?.message || '(Network error)';
+      addError(`Chat request failed: ${msg}`);
+      console.log('Error sending text chat:', error);
+    }
+  };
+
+  // --------------------------------------
+  // Agent call
+  // --------------------------------------
+  async function callAgentApi(userInput: string) {
+    if (!userInput.trim()) return;
+    addTask('Agent Request');
+    try {
+      const resp = await axios.post(`${BACKEND_URL}/api/agent`, {
+        user_input: textMessage.trim(),
+        chosen_model: textModel,
+      });
+      removeTask('Agent Request');
+
+      const { final_answer, debug_info } = resp.data;
+      console.log("Agent Debug Info:", debug_info);  // log to console
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: `agent-user-${Date.now()}`,
+          role: 'user',
+          type: 'text',
+          content: userInput,
+        },
+        {
+          id: `agent-answer-${Date.now()}`,
+          role: 'app',
+          type: 'text',
+          content: final_answer,
+        },
+      ]);
+    } catch (error: any) {
+      removeTask('Agent Request');
+      const msg = error?.message || '(Network error)';
+      addError(`Agent error: ${msg}`);
+      console.log('Error calling agent:', error);
+    }
   }
+
+  // --------------------------------------
+  // SPEAKER TOGGLE
+  // --------------------------------------
+  function toggleSpeaker() {
+    setSpeakerOn((prev) => !prev);
+  }
+
+  // --------------------------------------
+  // RENDER MESSAGES
+  // --------------------------------------
+  const renderMessage = ({ item }: { item: any }) => {
+    const isUser = item.role === 'user';
+    const bubbleStyle = isUser
+      ? [styles.bubble, styles.userBubble]
+      : [styles.bubble, styles.appBubble];
+    const textStyle = isUser ? styles.userText : styles.appText;
+
+    if (item.type === 'image') {
+      return (
+        <View style={bubbleStyle}>
+          <Image source={{ uri: item.content }} style={styles.imageBubble} />
+        </View>
+      );
+    }
+    return (
+      <View style={bubbleStyle}>
+        <Text style={textStyle}>{item.content}</Text>
+      </View>
+    );
+  };
+
+  // --------------------------------------
+  // FINAL RENDER
+  // --------------------------------------
+  return (
+    <View style={styles.container}>
+      <FlatList
+        data={messages}
+        renderItem={renderMessage}
+        keyExtractor={(item) => item.id}
+        contentContainerStyle={{ paddingTop: 10, paddingBottom: 80 }}
+        style={styles.chatList}
+      />
+
+      {/* Selected doc preview */}
+      {selectedDoc && (
+        <View style={styles.selectedFilePreview}>
+          <Text style={{ color: 'gray' }}>{`Doc attached: ${selectedDoc.name}`}</Text>
+        </View>
+      )}
+      {/* Selected image preview */}
+      {selectedImageUri && (
+        <View style={styles.selectedFilePreview}>
+          <Image
+            source={{ uri: selectedImageUri }}
+            style={{ width: 60, height: 60, borderRadius: 8 }}
+          />
+          <Text style={{ marginLeft: 10, color: 'gray' }}>Image attached</Text>
+        </View>
+      )}
+
+      {/* Bottom buttons row */}
+      <View style={styles.buttonsRow}>
+        <TouchableOpacity
+          style={styles.iconButton}
+          onPress={() => navigation.navigate('Settings')}
+        >
+          <MaterialCommunityIcons name="cog-outline" size={30} color="#fff" />
+        </TouchableOpacity>
+
+        <TouchableOpacity style={styles.iconButton} onPress={toggleAttachMenu}>
+          <MaterialCommunityIcons name="paperclip" size={25} color="#fff" />
+        </TouchableOpacity>
+        {showAttachMenu && (
+          <View style={styles.attachSubMenu}>
+            <TouchableOpacity style={styles.subButton} onPress={handlePickDoc}>
+              <MaterialCommunityIcons name="file-document" size={24} color="#fff" />
+            </TouchableOpacity>
+            <TouchableOpacity style={styles.subButton} onPress={handleTakePhoto}>
+              <MaterialCommunityIcons name="camera" size={24} color="#fff" />
+            </TouchableOpacity>
+            <TouchableOpacity style={styles.subButton} onPress={handleChooseFromGallery}>
+              <MaterialCommunityIcons name="folder-image" size={24} color="#fff" />
+            </TouchableOpacity>
+          </View>
+        )}
+
+        {/* Status button */}
+        <TouchableOpacity
+          style={[styles.iconButton, getStatusButtonStyle()]}
+          onPress={toggleStatusPopup}
+        >
+          <MaterialCommunityIcons
+            name={getStatusButtonIconName()}
+            size={30}
+            color="#fff"
+          />
+        </TouchableOpacity>
+
+        {/* Speaker toggle */}
+        <TouchableOpacity
+          style={[
+            styles.iconButton,
+            speakerOn ? { backgroundColor: 'green' } : { backgroundColor: 'red' },
+          ]}
+          onPress={toggleSpeaker}
+        >
+          <MaterialCommunityIcons name="volume-high" size={30} color="#fff" />
+        </TouchableOpacity>
+
+        {/* Microphone */}
+        <TouchableOpacity
+          style={[styles.iconButton, recording && styles.recording]}
+          onPress={recording ? stopRecording : startRecording}
+        >
+          <MaterialCommunityIcons name="microphone" size={30} color="#fff" />
+        </TouchableOpacity>
+
+        {/* NEW: Robot (Agent) Button */}
+        <TouchableOpacity
+          style={styles.iconButton}
+          onPress={() => {
+            if (textMessage.trim()) {
+              callAgentApi(textMessage.trim());
+              setTextMessage('');
+            }
+          }}
+        >
+          <MaterialCommunityIcons name="robot" size={30} color="#fff" />
+        </TouchableOpacity>
+      </View>
+
+      {/* Input row */}
+      <View style={styles.inputRow}>
+        <TextInput
+          style={styles.textInput}
+          placeholder="Type your message or doc description..."
+          value={textMessage}
+          onChangeText={setTextMessage}
+        />
+        <TouchableOpacity style={styles.sendButton} onPress={sendMessage}>
+          <MaterialCommunityIcons name="send" size={24} color="#fff" />
+        </TouchableOpacity>
+      </View>
+
+      {/* Status Popup */}
+      <Modal
+        visible={showStatusPopup}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setShowStatusPopup(false)}
+      >
+        <View style={styles.overlay}>
+          <View style={styles.popup}>
+            <Text style={styles.popupTitle}>Status</Text>
+
+            <Text style={styles.popupSubTitle}>Tasks in progress:</Text>
+            {tasksInProgress.length === 0 && (
+              <Text style={styles.popupText}>No active tasks.</Text>
+            )}
+            {tasksInProgress.map((t, idx) => (
+              <Text key={idx} style={styles.popupText}>
+                - {t}
+              </Text>
+            ))}
+
+            <Text style={[styles.popupSubTitle, { marginTop: 10 }]}>
+              Errors:
+            </Text>
+            {errors.length === 0 && (
+              <Text style={styles.popupText}>No errors.</Text>
+            )}
+            {errors.map((e, idx) => (
+              <Text key={idx} style={[styles.popupText, { color: 'red' }]}>
+                - {e}
+              </Text>
+            ))}
+
+            {/* Close / Clear */}
+            <View style={styles.popupButtonsRow}>
+              <TouchableOpacity
+                style={styles.popupButton}
+                onPress={() => setShowStatusPopup(false)}
+              >
+                <Text style={{ color: '#fff' }}>Close</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={styles.popupButton}
+                onPress={() => clearErrors()}
+              >
+                <Text style={{ color: '#fff' }}>Clear Errors</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
+    </View>
+  );
 }
 
-(Where the final item is an output_block with "final_message":"...".)
+export default HomeScreen;
 
-No disclaimers, no extra JSON at the top level. Just the single {"name":"plan_tasks","arguments":{...}}.
+// --------------------------------------
+// Styles
+// --------------------------------------
+const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+    marginTop: 40,
+    backgroundColor: '#f0f0f0',
+  },
+  chatList: {
+    flex: 1,
+  },
+  bubble: {
+    marginVertical: 4,
+    marginHorizontal: 8,
+    maxWidth: '70%',
+    borderRadius: 12,
+    padding: 8,
+  },
+  userBubble: {
+    alignSelf: 'flex-end',
+    backgroundColor: '#007aff',
+  },
+  appBubble: {
+    alignSelf: 'flex-start',
+    backgroundColor: '#ddd',
+  },
+  userText: {
+    color: '#fff',
+  },
+  appText: {
+    color: '#333',
+  },
+  imageBubble: {
+    width: 150,
+    height: 150,
+    borderRadius: 8,
+  },
+  selectedFilePreview: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginLeft: 8,
+    marginBottom: 5,
+  },
+  buttonsRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: 8,
+  },
+  iconButton: {
+    width: 50,
+    height: 50,
+    borderRadius: 25,
+    backgroundColor: '#555',
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginHorizontal: 5,
+  },
+  attachSubMenu: {
+    flexDirection: 'row',
+    marginLeft: 5,
+  },
+  subButton: {
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    backgroundColor: '#777',
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginHorizontal: 3,
+  },
+  recording: {
+    backgroundColor: 'red',
+  },
+  inputRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 8,
+    paddingBottom: 10,
+  },
+  textInput: {
+    flex: 1,
+    height: 45,
+    backgroundColor: '#fff',
+    borderRadius: 8,
+    paddingHorizontal: 10,
+  },
+  sendButton: {
+    width: 45,
+    height: 45,
+    borderRadius: 8,
+    marginLeft: 8,
+    backgroundColor: '#007aff',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  overlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.4)',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  popup: {
+    width: '80%',
+    backgroundColor: '#fff',
+    borderRadius: 8,
+    padding: 16,
+  },
+  popupTitle: {
+    fontSize: 18,
+    fontWeight: 'bold',
+    marginBottom: 10,
+    color: '#333',
+  },
+  popupSubTitle: {
+    fontWeight: '600',
+    marginBottom: 5,
+    color: '#333',
+  },
+  popupText: {
+    color: '#333',
+    marginBottom: 2,
+  },
+  popupButtonsRow: {
+    flexDirection: 'row',
+    justifyContent: 'flex-end',
+    marginTop: 15,
+  },
+  popupButton: {
+    backgroundColor: '#007aff',
+    borderRadius: 6,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    marginLeft: 10,
+  },
+});
 
-That’s it—no other text.
+--- SettingsScreen.tsx ---
+// SettingsScreen.tsx
+import React, {useContext} from 'react';
+import {View, Text, StyleSheet} from 'react-native';
+import {Picker} from '@react-native-picker/picker';
+import {ModelContext} from '../ModelContext';
 
-### Additional Nudges
+export default function SettingsScreen() {
+  const {
+    textModel, setTextModel,
+    imageModel, setImageModel,
+    whisperModel, setWhisperModel
+  } = useContext(ModelContext);
 
-- If the user says “clean up / sanitize / fix duplicates / fill missing columns,” that implies a real DB **update** or **delete** step. So your plan must contain a `batch_update_block` or `batch_delete_block` or a `sql_block` with `"action_type":"UPDATE"`/`"DELETE"`.  
-- Do **not** finalize with parse_block alone. The parse_block is only a “prep” step.  
-- Always produce an **output_block** at the end with `"final_message":"some short user-facing text"`.  
+  return (
+    <View style={styles.container}>
+      <Text style={styles.title}>Settings</Text>
+
+      {/* TEXT MODEL PICKER */}
+      <Text style={styles.label}>Select Text Model:</Text>
+      <Picker
+        selectedValue={textModel}
+        onValueChange={setTextModel}
+        style={{ color: 'black', backgroundColor: 'white' }}
+        itemStyle={{ color: 'black' }}
+      >
+        {/* Replace or add any text-based models you want */}
+        <Picker.Item label="GPT-3.5 Turbo"        value="gpt-3.5-turbo" />
+        <Picker.Item label="GPT-3.5 Turbo (16k)"  value="gpt-3.5-turbo-16k" />
+        <Picker.Item label="GPT-4"               value="gpt-4" />
+        <Picker.Item label="GPT-4 (0613)"        value="gpt-4-0613" />
+        {/* or add more if needed */}
+      </Picker>
+
+      {/* IMAGE MODEL PICKER */}
+      <Text style={styles.label}>Select Image Model:</Text>
+      <Picker
+        selectedValue={imageModel}
+        onValueChange={setImageModel}
+        style={{ color: 'black', backgroundColor: 'white' }}
+        itemStyle={{ color: 'black' }}
+      >
+        {/* Replace with whatever 'Vision' models you have */}
+        <Picker.Item label="GPT-4o" value="gpt-4o" />
+        <Picker.Item label="GPT-4o-mini" value="gpt-4o-mini" />
+      </Picker>
+
+      {/* WHISPER MODEL PICKER */}
+      <Text style={styles.label}>Select Whisper Model:</Text>
+      <Picker
+        selectedValue={whisperModel}
+        onValueChange={setWhisperModel}
+        style={{ color: 'black', backgroundColor: 'white' }}
+        itemStyle={{ color: 'black' }}
+      >
+        <Picker.Item label="tiny" value="tiny" />
+        <Picker.Item label="base" value="base" />
+        <Picker.Item label="small" value="small" />
+        <Picker.Item label="medium" value="medium" />
+        <Picker.Item label="large" value="large" />
+      </Picker>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: { flex: 1, padding: 16, marginTop: 40, backgroundColor: '#fff' },
+  title: { fontSize: 20, marginBottom: 20, color: 'black' },
+  label: { marginTop: 20, marginBottom: 5, color: 'black' },
+  picker: { height: 50, width: 220 },
+});

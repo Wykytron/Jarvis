@@ -25,18 +25,14 @@ NAME_SYNONYMS = {
 # Synonyms for date offsets
 ###############################################################################
 DATE_SYNONYMS = {
-    # existing shortcuts:
     "today": 0,
     "tomorrow": 1,
     "next week": 7,
-    # NEW or UPDATED: more offset patterns
+    # Add more as needed...
 }
 
 ###############################################################################
 # Additional patterns for "in X days/weeks"
-###############################################################################
-# We'll parse things like "in 2 days," "in 3 weeks," etc. 
-# If you like, you can expand to months or years.
 ###############################################################################
 DAYS_REGEX = re.compile(r"(?i)\bin\s+(\d+)\s+day(s)?\b")
 WEEKS_REGEX = re.compile(r"(?i)\bin\s+(\d+)\s+week(s)?\b")
@@ -83,7 +79,7 @@ def guess_expiration_date_from_text(text: str, current_dt_fn):
 
     Returns an ISO date string or None.
     """
-    # 1) Check the simpler known synonyms first (e.g. "next week", "tomorrow")
+    # 1) known synonyms "expires tomorrow", etc.
     pat_syn = re.search(r"(expires|expiring|expiry)\s+(today|tomorrow|next week)\b", text, re.IGNORECASE)
     if pat_syn:
         phrase = pat_syn.group(2).lower()
@@ -92,8 +88,7 @@ def guess_expiration_date_from_text(text: str, current_dt_fn):
         real_dt = now_dt + datetime.timedelta(days=offset_days)
         return real_dt.strftime("%Y-%m-%d")
 
-    # 2) Check "in X days"
-    #    e.g. "in 3 days"
+    # 2) "in X days"
     pat_days = DAYS_REGEX.search(text)
     if pat_days:
         offset_days = int(pat_days.group(1))
@@ -101,8 +96,7 @@ def guess_expiration_date_from_text(text: str, current_dt_fn):
         real_dt = now_dt + datetime.timedelta(days=offset_days)
         return real_dt.strftime("%Y-%m-%d")
 
-    # 3) Check "in X weeks"
-    #    e.g. "in 2 weeks"
+    # 3) "in X weeks"
     pat_weeks = WEEKS_REGEX.search(text)
     if pat_weeks:
         offset_weeks = int(pat_weeks.group(1))
@@ -110,16 +104,15 @@ def guess_expiration_date_from_text(text: str, current_dt_fn):
         real_dt = now_dt + datetime.timedelta(days=7 * offset_weeks)
         return real_dt.strftime("%Y-%m-%d")
 
-    # If none matched, return None
     return None
 
 ###############################################################################
-# The parse_block logic
+# handle_parse_block
 ###############################################################################
 def handle_parse_block(args: Dict[str, Any], task_memory: dict, debug_info: list) -> dict:
     """
-    parse_block can parse raw_text from the user, unify user text,
-    fill missing columns, etc. The final structured output goes into parsed_item.
+    parse_block: parse or unify user text + optional db_rows => produce a structured parsed_item.
+    No DB changes here.
     """
     raw_text = args.get("raw_text", "")
     explanation = args.get("explanation", "")
@@ -129,14 +122,14 @@ def handle_parse_block(args: Dict[str, Any], task_memory: dict, debug_info: list
 
     from agent.global_store import TABLE_SCHEMAS, CURRENT_DATETIME_FN
 
-    # Possibly unify synonyms if 'name' is in parsed_item
+    # unify synonyms if 'name' is present
     if "name" in parsed_item:
         old_name = parsed_item["name"]
         new_name = dictionary_normalize_item_name(old_name)
         parsed_item["name"] = new_name
         debug_info.append(f"[parse_block] Normalized name '{old_name}' => '{new_name}'")
 
-    # If no 'quantity' or 'unit', attempt to guess from raw_text
+    # guess quantity, unit from raw_text if not present
     if "quantity" not in parsed_item or "unit" not in parsed_item:
         (qty_guess, unit_guess) = guess_quantity_and_unit_from_text(raw_text)
         if qty_guess is not None and "quantity" not in parsed_item:
@@ -144,31 +137,30 @@ def handle_parse_block(args: Dict[str, Any], task_memory: dict, debug_info: list
         if unit_guess is not None and "unit" not in parsed_item:
             parsed_item["unit"] = unit_guess
 
-    # If no expiration_date yet, try to guess from raw_text
+    # guess expiration date
     if "expiration_date" not in parsed_item or not parsed_item.get("expiration_date"):
         dt_guess = guess_expiration_date_from_text(raw_text, CURRENT_DATETIME_FN)
         if dt_guess:
             parsed_item["expiration_date"] = dt_guess
 
-    # Optionally fill missing columns based on the target_table schema
+    # fill missing columns if known
     target_table = task_memory.get("target_table", "")
     col_list = TABLE_SCHEMAS.get(target_table, [])
     debug_info.append(f"[parse_block] target_table => {target_table}, col_list => {col_list}")
 
-    for col_name in col_list:
-        if col_name not in parsed_item:
-            if col_name == "quantity":
-                parsed_item[col_name] = 1.0
-            elif col_name == "unit":
-                parsed_item[col_name] = "unit"
-            elif col_name == "expiration_date":
-                parsed_item[col_name] = None
-            elif col_name == "category":
-                parsed_item[col_name] = "misc"
+    for c in col_list:
+        if c not in parsed_item:
+            if c == "quantity":
+                parsed_item[c] = 1.0
+            elif c == "unit":
+                parsed_item[c] = "unit"
+            elif c == "expiration_date":
+                parsed_item[c] = None
+            elif c == "category":
+                parsed_item[c] = "misc"
 
     debug_info.append(f"[parse_block] final parsed_item => {parsed_item}")
 
-    # Return only the parsed_item (and explanation if you like).
     return {
         "success": True,
         "parsed_item": parsed_item,
@@ -176,7 +168,7 @@ def handle_parse_block(args: Dict[str, Any], task_memory: dict, debug_info: list
     }
 
 ###############################################################################
-# Case-insensitive WHERE for "WHERE name='tomatoes'"
+# Case-insensitive WHERE
 ###############################################################################
 def build_case_insensitive_where(where_str: str) -> str:
     pattern = r"(?i)WHERE\s+name\s*=\s*([\"'])(.*?)\1"
@@ -206,10 +198,7 @@ def handle_sql_block(args: Dict[str, Any], task_memory: dict, debug_info: list) 
     explanation = args.get("explanation", "")
     where_clause = args.get("where_clause", "").strip()
 
-    debug_info.append(
-        f"[sql_block] table={table_name}, cols={columns}, vals={values}, "
-        f"action={action_type}, where={where_clause}"
-    )
+    debug_info.append(f"[sql_block] table={table_name}, cols={columns}, vals={values}, action={action_type}, where={where_clause}")
 
     permission_mode = table_permissions.get(table_name, "ALWAYS_DENY")
     user_permission = True  # or do some real check
@@ -285,7 +274,7 @@ def handle_sql_block(args: Dict[str, Any], task_memory: dict, debug_info: list) 
         return {"error": msg}
 
 ###############################################################################
-# SELECT, WRITE queries
+# SELECT / WRITE queries
 ###############################################################################
 def run_select_query(sql_query: str, explanation: str, debug_info: list, task_memory: dict) -> dict:
     db = SessionLocal()
@@ -310,9 +299,7 @@ def run_select_query(sql_query: str, explanation: str, debug_info: list, task_me
     if error_msg:
         return {"error": error_msg, "sql_query": sql_query}
 
-    # Store rows for parse_block or other uses
     task_memory["last_sql_rows"] = rows_data
-
     return {
         "success": True,
         "rows_data": rows_data,
@@ -349,12 +336,9 @@ def run_write_query(sql_query: str, explanation: str, debug_info: list) -> dict:
     }
 
 ###############################################################################
-# Batch blocks
+# BATCH blocks
 ###############################################################################
 def handle_batch_insert_block(args: Dict[str, Any], task_memory: dict, debug_info: list) -> dict:
-    """
-    Insert multiple rows in a single call.
-    """
     table_name = args.get("table_name","").strip()
     rows_info = args.get("rows", [])
     explanation = args.get("explanation","")
@@ -382,9 +366,8 @@ def handle_batch_insert_block(args: Dict[str, Any], task_memory: dict, debug_inf
 
             col_list_str = ", ".join(columns)
             val_list_str = ", ".join(quote_if_needed(v) for v in values)
-            sql_query = f"INSERT INTO {table_name} ({col_list_str}) VALUES ({val_list_str});"
+            sql_query = f"INSERT INTO {table_name}({col_list_str}) VALUES({val_list_str});"
             debug_info.append(f"[batch_insert] => {sql_query}")
-
             result = db.execute(text(sql_query))
             rowcount = result.rowcount or 0
             inserted_count += rowcount
@@ -408,9 +391,6 @@ def handle_batch_insert_block(args: Dict[str, Any], task_memory: dict, debug_inf
     }
 
 def handle_batch_update_block(args: Dict[str, Any], task_memory: dict, debug_info: list) -> dict:
-    """
-    Update multiple rows in one call.
-    """
     table_name = args.get("table_name","").strip()
     rows_info = args.get("rows", [])
     explanation = args.get("explanation","")
@@ -447,7 +427,6 @@ def handle_batch_update_block(args: Dict[str, Any], task_memory: dict, debug_inf
             set_stmt = ", ".join(set_clauses)
             sql_query = f"UPDATE {table_name} SET {set_stmt} {where_clause};"
             debug_info.append(f"[batch_update] => {sql_query}")
-
             result = db.execute(text(sql_query))
             rowcount = result.rowcount or 0
             updated_count += rowcount
@@ -470,9 +449,6 @@ def handle_batch_update_block(args: Dict[str, Any], task_memory: dict, debug_inf
     }
 
 def handle_batch_delete_block(args: Dict[str, Any], task_memory: dict, debug_info: list) -> dict:
-    """
-    Delete multiple rows in one call.
-    """
     table_name = args.get("table_name", "").strip()
     rows_info = args.get("rows", [])
     explanation = args.get("explanation", "")
@@ -491,7 +467,6 @@ def handle_batch_delete_block(args: Dict[str, Any], task_memory: dict, debug_inf
     deleted_count = 0
     error_msg = None
     db = SessionLocal()
-
     try:
         for row_data in rows_info:
             where_clause = row_data.get("where_clause", "").strip()
@@ -501,7 +476,6 @@ def handle_batch_delete_block(args: Dict[str, Any], task_memory: dict, debug_inf
             final_where = build_case_insensitive_where(where_clause)
             sql_query = f"DELETE FROM {table_name} {final_where};"
             debug_info.append(f"[batch_delete_block] => {sql_query}")
-
             result = db.execute(text(sql_query))
             rowcount = result.rowcount or 0
             deleted_count += rowcount
@@ -529,8 +503,9 @@ def handle_batch_delete_block(args: Dict[str, Any], task_memory: dict, debug_inf
 ###############################################################################
 def handle_output_block(args: Dict[str, Any], task_memory: dict, debug_info: list) -> dict:
     """
-    Final user-facing output. We look up recent_sql_result or parse_result 
-    to see if there's an error or zero matches, etc.
+    The output_block is an older final step approach. 
+    Now we typically rely on reflect_block, but if used:
+     - produce a final_answer from recent_sql_result or user-provided final_message
     """
     llm_message = args.get("final_message", "").strip()
     if not llm_message:
@@ -568,7 +543,6 @@ def handle_output_block(args: Dict[str, Any], task_memory: dict, debug_info: lis
         else:
             return {"final_answer": llm_message}
 
-    # If none matched, just return the message
     return {"final_answer": llm_message}
 
 ###############################################################################
@@ -576,8 +550,8 @@ def handle_output_block(args: Dict[str, Any], task_memory: dict, debug_info: lis
 ###############################################################################
 def handle_chat_block(args: Dict[str, Any], task_memory: dict, debug_info: list) -> dict:
     """
-    The new chat_block that does open-ended reasoning or Q/A.
-    We feed user_prompt + optional context to OpenAI and store the result.
+    chat_block: open-ended conversation or reasoning. 
+    Return => {"response_text":"some text"}.
     """
     user_prompt = args.get("user_prompt", "")
     context = args.get("context", "")
@@ -588,7 +562,6 @@ def handle_chat_block(args: Dict[str, Any], task_memory: dict, debug_info: list)
     model_name = task_memory.get("agent_model", "gpt-4-0613")
     client = openai.OpenAI(api_key=openai.api_key)
 
-    # Merge user_prompt + context into a single query:
     chat_query = f"User Prompt: {user_prompt}\nContext: {context}\nRespond helpfully."
 
     try:
@@ -616,3 +589,47 @@ def handle_chat_block(args: Dict[str, Any], task_memory: dict, debug_info: list)
             "explanation": explanation
         }
 
+###############################################################################
+# handle_reflect_block
+###############################################################################
+def handle_reflect_block(args: Dict[str, Any], task_memory: dict, debug_info: list) -> dict:
+    """
+    reflect_block:
+     - sees entire task_memory
+     - can produce final_message, data_output, or additional_tasks
+       for more steps.
+    Example JSON:
+      {
+        "reasoning": "...some reflection...",
+        "final_message": "User facing text if done",
+        "data_output": {
+          "rows":[...],
+          "any_other_data":"..."
+        },
+        "additional_tasks":[
+          {"block":"sql_block","description":"...",...}, ...
+        ]
+      }
+    """
+    reasoning = args.get("reasoning", "")
+    final_message = args.get("final_message", None)
+    data_output = args.get("data_output", None)
+    additional_tasks = args.get("additional_tasks", None)
+
+    debug_info.append(f"[reflect_block] reasoning => {reasoning}")
+    if final_message:
+        debug_info.append(f"[reflect_block] final_message => {final_message}")
+
+    # Return structure so orchestrator can interpret
+    return_dict = {
+        "success": True,
+        "reasoning": reasoning
+    }
+    if final_message:
+        return_dict["final_message"] = final_message
+    if data_output:
+        return_dict["data_output"] = data_output
+    if additional_tasks:
+        return_dict["additional_tasks"] = additional_tasks
+
+    return return_dict
